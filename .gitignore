@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Frontend build output
+dist/
+
+# Rust/Tauri build output
+src-tauri/target/
+src-tauri/gen/
+
+# Local release artifacts
+release/
+
+# Environment and local editor state
+.env
+.env.*
+!.env.example
+.DS_Store
+._*
+*.log
+
+# OS/package-manager noise
+Thumbs.db
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*

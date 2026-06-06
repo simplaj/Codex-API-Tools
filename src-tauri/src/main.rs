@@ -74,6 +74,7 @@ struct InspectState {
     auth_exists: bool,
     backup_root: String,
     backup_dirs: Vec<String>,
+    provider_choices: Vec<String>,
     config: Option<ConfigView>,
     runtime: RuntimeStatus,
 }
@@ -188,6 +189,22 @@ struct SqliteUpdateStats {
     user_event_rows_updated: usize,
     cwd_rows_updated: usize,
     database_present: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ThreadCwdStat {
+    cwd: String,
+    normalized_cwd: String,
+    count: usize,
+    updated_at_ms: i64,
+}
+
+#[derive(Default)]
+struct WorkspaceRootSyncStats {
+    present: bool,
+    updated: bool,
+    updated_workspace_roots: usize,
+    saved_workspace_root_count: usize,
 }
 
 fn main() {
@@ -570,6 +587,14 @@ fn state_db_path(codex_home: &Path) -> PathBuf {
     codex_home.join(DB_FILE_BASENAME)
 }
 
+fn global_state_path(codex_home: &Path) -> PathBuf {
+    codex_home.join(GLOBAL_STATE_FILE_BASENAME)
+}
+
+fn global_state_backup_path(codex_home: &Path) -> PathBuf {
+    codex_home.join(GLOBAL_STATE_BACKUP_FILE_BASENAME)
+}
+
 fn sync_backup_file_paths(codex_home: &Path) -> Vec<PathBuf> {
     let mut paths = vec![codex_home.join("config.toml")];
     for suffix in ["", "-shm", "-wal"] {
@@ -578,6 +603,123 @@ fn sync_backup_file_paths(codex_home: &Path) -> Vec<PathBuf> {
     paths.push(codex_home.join(GLOBAL_STATE_FILE_BASENAME));
     paths.push(codex_home.join(GLOBAL_STATE_BACKUP_FILE_BASENAME));
     paths
+}
+
+fn to_desktop_workspace_path(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return value.to_string();
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("\\\\?\\unc\\") {
+        return format!("\\\\{}", &trimmed[8..]).replace('/', "\\");
+    }
+    if trimmed.starts_with("\\\\?\\") {
+        return trimmed[4..].replace('/', "\\");
+    }
+    value.to_string()
+}
+
+fn normalize_comparable_path(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let mut normalized = if lower.starts_with("\\\\?\\unc\\") {
+        format!("\\\\{}", &trimmed[8..])
+    } else if trimmed.starts_with("\\\\?\\") {
+        trimmed[4..].to_string()
+    } else {
+        trimmed.to_string()
+    };
+    normalized = normalized.replace('/', "\\");
+    while normalized.ends_with('\\') {
+        normalized.pop();
+    }
+    if normalized.len() == 2 && normalized.as_bytes().get(1) == Some(&b':') {
+        normalized.push('\\');
+    }
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(normalized.to_ascii_lowercase())
+}
+
+fn to_path_array(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(ToString::to_string)
+            .collect(),
+        Some(Value::String(value)) if !value.trim().is_empty() => vec![value.clone()],
+        _ => Vec::new(),
+    }
+}
+
+fn dedupe_paths(paths: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut output = Vec::new();
+    for path in paths {
+        let Some(comparable) = normalize_comparable_path(&path) else {
+            continue;
+        };
+        if seen.insert(comparable) {
+            output.push(path);
+        }
+    }
+    output
+}
+
+fn count_array_changes(previous: &[String], next: &[String]) -> usize {
+    let compared = previous.len().max(next.len());
+    (0..compared)
+        .filter(|index| previous.get(*index) != next.get(*index))
+        .count()
+}
+
+fn strings_to_json_array(values: &[String]) -> Value {
+    Value::Array(values.iter().cloned().map(Value::String).collect())
+}
+
+fn resolve_stored_path(value: &str, cwd_stats: &[ThreadCwdStat]) -> String {
+    let Some(comparable) = normalize_comparable_path(value) else {
+        return value.to_string();
+    };
+    let mut matches: Vec<&ThreadCwdStat> = cwd_stats
+        .iter()
+        .filter(|entry| entry.normalized_cwd == comparable)
+        .collect();
+    if matches.is_empty() {
+        return to_desktop_workspace_path(value);
+    }
+    matches.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| right.updated_at_ms.cmp(&left.updated_at_ms))
+            .then_with(|| left.cwd.cmp(&right.cwd))
+    });
+    to_desktop_workspace_path(&matches[0].cwd)
+}
+
+fn copy_resolved_object_keys(input: &Value, cwd_stats: &[ThreadCwdStat]) -> Value {
+    let Value::Object(map) = input else {
+        return input.clone();
+    };
+    let mut output = serde_json::Map::new();
+    for (key, value) in map {
+        let resolved = resolve_stored_path(key, cwd_stats);
+        if !output.contains_key(&resolved) || resolved == *key {
+            output.insert(resolved, value.clone());
+        }
+    }
+    Value::Object(output)
 }
 
 fn read_first_line_record(path: &Path) -> Result<FirstLineRecord, String> {
@@ -727,7 +869,7 @@ fn collect_rollout_scan(
                 .get("cwd")
                 .and_then(Value::as_str)
                 .filter(|value| !value.trim().is_empty())
-                .map(ToString::to_string);
+                .map(to_desktop_workspace_path);
             if let (Some(thread_id), Some(cwd)) = (thread_id.as_ref(), cwd.as_ref()) {
                 scan.thread_cwd_by_id.insert(thread_id.clone(), cwd.clone());
             }
@@ -921,6 +1063,382 @@ fn read_sqlite_provider_counts(
     Ok(Some(counts))
 }
 
+fn build_time_expression(columns: &HashSet<String>) -> String {
+    let mut expressions = Vec::new();
+    if columns.contains("updated_at_ms") {
+        expressions.push("updated_at_ms");
+    }
+    if columns.contains("updated_at") {
+        expressions.push("updated_at * 1000");
+    }
+    if columns.contains("created_at_ms") {
+        expressions.push("created_at_ms");
+    }
+    if columns.contains("created_at") {
+        expressions.push("created_at * 1000");
+    }
+    expressions.push("0");
+    format!("COALESCE({})", expressions.join(", "))
+}
+
+fn read_thread_cwd_stats(codex_home: &Path) -> Result<Vec<ThreadCwdStat>, String> {
+    let db_path = state_db_path(codex_home);
+    if !path_exists(&db_path) {
+        return Ok(Vec::new());
+    }
+
+    let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| sqlite_error("读取 SQLite cwd 统计", error))?;
+    conn.busy_timeout(Duration::from_millis(5000))
+        .map_err(|error| sqlite_error("读取 SQLite cwd 统计", error))?;
+    let columns = sqlite_columns(&conn, "threads")?;
+    if !columns.contains("cwd") {
+        return Ok(Vec::new());
+    }
+
+    let updated_at_expr = if columns.contains("updated_at_ms") {
+        if columns.contains("updated_at") {
+            "COALESCE(MAX(updated_at_ms), MAX(updated_at) * 1000, 0)"
+        } else {
+            "COALESCE(MAX(updated_at_ms), 0)"
+        }
+    } else if columns.contains("updated_at") {
+        "COALESCE(MAX(updated_at) * 1000, 0)"
+    } else {
+        "0"
+    };
+    let sql = format!(
+        "SELECT cwd, COUNT(*) AS count, {updated_at_expr} AS updated_at_ms \
+         FROM threads \
+         WHERE cwd IS NOT NULL AND cwd <> '' \
+         GROUP BY cwd \
+         ORDER BY count DESC, updated_at_ms DESC, cwd"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|error| sqlite_error("读取 SQLite cwd 统计", error))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|error| sqlite_error("读取 SQLite cwd 统计", error))?;
+
+    let mut stats = Vec::new();
+    for row in rows {
+        let (cwd, count, updated_at_ms) =
+            row.map_err(|error| sqlite_error("读取 SQLite cwd 统计", error))?;
+        let Some(normalized_cwd) = normalize_comparable_path(&cwd) else {
+            continue;
+        };
+        stats.push(ThreadCwdStat {
+            cwd,
+            normalized_cwd,
+            count: count.max(0) as usize,
+            updated_at_ms,
+        });
+    }
+    Ok(stats)
+}
+
+fn read_workspace_roots_from_global_state(state: &Value) -> Vec<String> {
+    let saved_roots = to_path_array(state.get("electron-saved-workspace-roots"));
+    let project_order = to_path_array(state.get("project-order"));
+    let active_roots = to_path_array(state.get("active-workspace-roots"));
+    let combined = if project_order.is_empty() {
+        [saved_roots, active_roots].concat()
+    } else {
+        [project_order, saved_roots, active_roots].concat()
+    };
+    dedupe_paths(
+        combined
+            .into_iter()
+            .map(|path| to_desktop_workspace_path(&path))
+            .collect(),
+    )
+}
+
+fn read_project_thread_visibility(codex_home: &Path) -> Result<Vec<String>, String> {
+    let file_path = global_state_path(codex_home);
+    if !path_exists(&file_path) {
+        return Ok(Vec::new());
+    }
+    let state_text = fs::read_to_string(&file_path).map_err(command_error)?;
+    let state = serde_json::from_str::<Value>(&state_text).map_err(command_error)?;
+    let roots = read_workspace_roots_from_global_state(&state);
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let db_path = state_db_path(codex_home);
+    if !path_exists(&db_path) {
+        return Ok(roots
+            .into_iter()
+            .map(|root| {
+                format!(
+                    "{}: interactive 0, first page 0/50, ranks (none), exact cwd 0/0, providers (none)",
+                    to_desktop_workspace_path(&root)
+                )
+            })
+            .collect());
+    }
+
+    let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| sqlite_error("读取项目可见性诊断", error))?;
+    conn.busy_timeout(Duration::from_millis(5000))
+        .map_err(|error| sqlite_error("读取项目可见性诊断", error))?;
+    let columns = sqlite_columns(&conn, "threads")?;
+    if !columns.contains("cwd") {
+        return Ok(Vec::new());
+    }
+
+    let source_filter = if columns.contains("source") {
+        "AND source IN ('cli', 'vscode')"
+    } else {
+        ""
+    };
+    let archived_filter = if columns.contains("archived") {
+        "AND archived = 0"
+    } else {
+        ""
+    };
+    let first_user_filter = if columns.contains("first_user_message") {
+        "AND first_user_message <> ''"
+    } else {
+        ""
+    };
+    let time_expr = build_time_expression(&columns);
+    let provider_expr = if columns.contains("model_provider") {
+        "model_provider"
+    } else {
+        "'' AS model_provider"
+    };
+    let sql = format!(
+        "SELECT id, cwd, {provider_expr}, {time_expr} AS sort_ts \
+         FROM threads \
+         WHERE cwd IS NOT NULL AND cwd <> '' \
+         {archived_filter} \
+         {first_user_filter} \
+         {source_filter} \
+         ORDER BY sort_ts DESC, id DESC"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|error| sqlite_error("读取项目可见性诊断", error))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            ))
+        })
+        .map_err(|error| sqlite_error("读取项目可见性诊断", error))?;
+
+    let mut ranked_rows = Vec::new();
+    for (index, row) in rows.enumerate() {
+        let (cwd, provider) = row.map_err(|error| sqlite_error("读取项目可见性诊断", error))?;
+        ranked_rows.push((
+            index + 1,
+            cwd.clone(),
+            to_desktop_workspace_path(&cwd),
+            normalize_comparable_path(&cwd),
+            if provider.trim().is_empty() {
+                "(missing)".to_string()
+            } else {
+                provider
+            },
+        ));
+    }
+
+    Ok(roots
+        .into_iter()
+        .map(|root| {
+            let normalized_root = normalize_comparable_path(&root);
+            let exact_root = to_desktop_workspace_path(&root);
+            let matching_rows: Vec<_> = ranked_rows
+                .iter()
+                .filter(|(_, _, _, normalized_cwd, _)| *normalized_cwd == normalized_root)
+                .collect();
+            let ranks: Vec<usize> = matching_rows.iter().map(|(rank, _, _, _, _)| *rank).collect();
+            let rank_preview = if ranks.is_empty() {
+                "(none)".to_string()
+            } else {
+                let preview = ranks
+                    .iter()
+                    .take(12)
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if ranks.len() > 12 {
+                    format!("{preview} (+{} more)", ranks.len() - 12)
+                } else {
+                    preview
+                }
+            };
+            let mut provider_counts = HashMap::new();
+            let mut exact_matches = 0usize;
+            let mut verbatim_cwd_rows = 0usize;
+            for (_, cwd, desktop_cwd, _, provider) in &matching_rows {
+                *provider_counts.entry((*provider).clone()).or_insert(0) += 1;
+                if *cwd == exact_root {
+                    exact_matches += 1;
+                }
+                if cwd.starts_with(r"\\?\") {
+                    verbatim_cwd_rows += 1;
+                }
+                let _ = desktop_cwd;
+            }
+            let first_page = ranks.iter().filter(|rank| **rank <= 50).count();
+            format!(
+                "{exact_root}: interactive {}, first page {first_page}/50, ranks {rank_preview}, exact cwd {exact_matches}/{}, verbatim cwd {verbatim_cwd_rows}, providers {}",
+                matching_rows.len(),
+                matching_rows.len(),
+                format_counts(&provider_counts)
+            )
+        })
+        .collect())
+}
+
+fn sync_workspace_roots(
+    codex_home: &Path,
+    cwd_stats: &[ThreadCwdStat],
+) -> Result<WorkspaceRootSyncStats, String> {
+    let file_path = global_state_path(codex_home);
+    if !path_exists(&file_path) {
+        return Ok(WorkspaceRootSyncStats::default());
+    }
+
+    let original_text = fs::read_to_string(&file_path).map_err(command_error)?;
+    let mut state = serde_json::from_str::<Value>(&original_text).map_err(command_error)?;
+    let Some(map) = state.as_object_mut() else {
+        return Err(format!(
+            "{} 不是 JSON object，无法同步项目根路径缓存。",
+            path_to_string(&file_path)
+        ));
+    };
+
+    let existing_saved_roots = to_path_array(map.get("electron-saved-workspace-roots"));
+    let existing_project_order = to_path_array(map.get("project-order"));
+    let existing_active_roots = to_path_array(map.get("active-workspace-roots"));
+
+    let next_saved_roots = dedupe_paths(
+        (if existing_project_order.is_empty() {
+            [existing_saved_roots.clone(), existing_active_roots.clone()].concat()
+        } else {
+            [
+                existing_project_order.clone(),
+                existing_saved_roots.clone(),
+                existing_active_roots.clone(),
+            ]
+            .concat()
+        })
+        .into_iter()
+        .map(|path| resolve_stored_path(&path, cwd_stats))
+        .collect(),
+    );
+    let next_project_order = dedupe_paths(
+        (if existing_project_order.is_empty() {
+            next_saved_roots.clone()
+        } else {
+            [existing_project_order.clone(), existing_saved_roots.clone()].concat()
+        })
+        .into_iter()
+        .map(|path| resolve_stored_path(&path, cwd_stats))
+        .collect(),
+    );
+    let next_active_roots = dedupe_paths(
+        existing_active_roots
+            .iter()
+            .map(|path| resolve_stored_path(path, cwd_stats))
+            .collect(),
+    );
+
+    let original_active_value = map.get("active-workspace-roots").cloned();
+    let next_active_value = if original_active_value
+        .as_ref()
+        .map(Value::is_array)
+        .unwrap_or(false)
+    {
+        strings_to_json_array(&next_active_roots)
+    } else {
+        next_active_roots
+            .first()
+            .cloned()
+            .map(Value::String)
+            .unwrap_or_else(|| original_active_value.clone().unwrap_or(Value::Null))
+    };
+    let next_labels = map
+        .get("electron-workspace-root-labels")
+        .map(|value| copy_resolved_object_keys(value, cwd_stats));
+    let next_open_targets = map.get("open-in-target-preferences").map(|value| {
+        let Value::Object(original) = value else {
+            return value.clone();
+        };
+        let mut next = original.clone();
+        if let Some(per_path) = original.get("perPath") {
+            next.insert(
+                "perPath".to_string(),
+                copy_resolved_object_keys(per_path, cwd_stats),
+            );
+        }
+        Value::Object(next)
+    });
+
+    let saved_roots_changed = existing_saved_roots != next_saved_roots;
+    let project_order_changed = existing_project_order != next_project_order;
+    let active_roots_changed = original_active_value.as_ref() != Some(&next_active_value);
+    let labels_changed = next_labels
+        .as_ref()
+        .map(|value| map.get("electron-workspace-root-labels") != Some(value))
+        .unwrap_or(false);
+    let open_targets_changed = next_open_targets
+        .as_ref()
+        .map(|value| map.get("open-in-target-preferences") != Some(value))
+        .unwrap_or(false);
+    let backup_missing = !path_exists(&global_state_backup_path(codex_home));
+
+    map.insert(
+        "electron-saved-workspace-roots".to_string(),
+        strings_to_json_array(&next_saved_roots),
+    );
+    map.insert(
+        "project-order".to_string(),
+        strings_to_json_array(&next_project_order),
+    );
+    map.insert("active-workspace-roots".to_string(), next_active_value);
+    if let Some(next_labels) = next_labels {
+        map.insert("electron-workspace-root-labels".to_string(), next_labels);
+    }
+    if let Some(next_open_targets) = next_open_targets {
+        map.insert("open-in-target-preferences".to_string(), next_open_targets);
+    }
+
+    let updated = saved_roots_changed
+        || project_order_changed
+        || active_roots_changed
+        || labels_changed
+        || open_targets_changed
+        || backup_missing;
+    if updated {
+        let next_text = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&state).map_err(command_error)?
+        );
+        fs::write(&file_path, &next_text).map_err(command_error)?;
+        fs::write(global_state_backup_path(codex_home), next_text).map_err(command_error)?;
+    }
+
+    Ok(WorkspaceRootSyncStats {
+        present: true,
+        updated,
+        updated_workspace_roots: count_array_changes(&existing_saved_roots, &next_saved_roots),
+        saved_workspace_root_count: next_saved_roots.len(),
+    })
+}
+
 fn assert_sqlite_writable(codex_home: &Path) -> Result<bool, String> {
     let db_path = state_db_path(codex_home);
     if !path_exists(&db_path) {
@@ -1063,6 +1581,46 @@ fn resolve_sync_target(provider_id: Option<String>) -> String {
         .unwrap_or_else(current_provider_from_config)
 }
 
+fn provider_choices(
+    config_text: Option<&str>,
+    rollout_counts: &HashMap<String, usize>,
+    sqlite_counts: Option<&HashMap<String, usize>>,
+) -> Vec<String> {
+    let mut choices = HashSet::new();
+    choices.insert(DEFAULT_CODEX_PROVIDER.to_string());
+
+    if let Some(config_text) = config_text {
+        choices.insert(parse_root_provider(config_text));
+        for section in parse_provider_sections(config_text) {
+            choices.insert(section.id);
+        }
+    }
+
+    for key in rollout_counts.keys() {
+        if let Some((_, provider)) = key.split_once('/') {
+            if provider != "(missing)" {
+                choices.insert(provider.to_string());
+            }
+        }
+    }
+    if let Some(sqlite_counts) = sqlite_counts {
+        for key in sqlite_counts.keys() {
+            if let Some((_, provider)) = key.split_once('/') {
+                if provider != "(missing)" {
+                    choices.insert(provider.to_string());
+                }
+            }
+        }
+    }
+
+    let mut output: Vec<String> = choices
+        .into_iter()
+        .filter(|provider| !provider.trim().is_empty())
+        .collect();
+    output.sort();
+    output
+}
+
 fn render_native_status() -> Result<String, String> {
     let codex_home = codex_home()?;
     let current_provider = current_provider_from_config();
@@ -1078,6 +1636,7 @@ fn render_native_status() -> Result<String, String> {
         .unwrap_or_default();
     let rollout_scan = collect_rollout_scan(&codex_home, None)?;
     let sqlite_counts = read_sqlite_provider_counts(&codex_home)?;
+    let project_visibility = read_project_thread_visibility(&codex_home)?;
 
     let mut lines = vec![
         format!("Codex home: {}", path_to_string(&codex_home)),
@@ -1106,6 +1665,13 @@ fn render_native_status() -> Result<String, String> {
         rollout_scan.user_event_thread_ids.len(),
         rollout_scan.thread_cwd_by_id.len()
     ));
+    if !project_visibility.is_empty() {
+        lines.push(String::new());
+        lines.push("Project visibility:".into());
+        for project in project_visibility {
+            lines.push(format!("  {project}"));
+        }
+    }
 
     Ok(lines.join("\n"))
 }
@@ -1113,10 +1679,12 @@ fn render_native_status() -> Result<String, String> {
 fn run_native_sync(target_provider: &str) -> Result<String, String> {
     let codex_home = codex_home()?;
     let scan = collect_rollout_scan(&codex_home, Some(target_provider))?;
+    let cwd_stats = read_thread_cwd_stats(&codex_home)?;
     let sqlite_present = assert_sqlite_writable(&codex_home)?;
     let backup = create_sync_backup(&scan, target_provider)?;
     let (applied_rollouts, skipped_rollouts) = apply_rollout_changes(&scan.changes)?;
     let sqlite_stats = update_sqlite_provider(&codex_home, target_provider, &scan)?;
+    let workspace_stats = sync_workspace_roots(&codex_home, &cwd_stats)?;
 
     let mut lines = vec![
         format!("Target provider: {target_provider}"),
@@ -1131,6 +1699,23 @@ fn run_native_sync(target_provider: &str) -> Result<String, String> {
                 ""
             } else {
                 " (state_5.sqlite not found)"
+            }
+        ),
+        format!(
+            "Updated workspace roots: {}{}",
+            workspace_stats.updated_workspace_roots,
+            if workspace_stats.present {
+                format!(
+                    " (saved roots {}, {})",
+                    workspace_stats.saved_workspace_root_count,
+                    if workspace_stats.updated {
+                        "changed"
+                    } else {
+                        "unchanged"
+                    }
+                )
+            } else {
+                " (.codex-global-state.json not found)".to_string()
             }
         ),
     ];
@@ -1271,6 +1856,13 @@ fn inspect() -> Result<InspectState, String> {
     let config_path = config_path()?;
     let auth_path = auth_path()?;
     let config_text = fs::read_to_string(&config_path).ok();
+    let rollout_scan = collect_rollout_scan(&codex_home, None).unwrap_or_default();
+    let sqlite_counts = read_sqlite_provider_counts(&codex_home).ok().flatten();
+    let provider_choices = provider_choices(
+        config_text.as_deref(),
+        &rollout_scan.provider_counts,
+        sqlite_counts.as_ref(),
+    );
     let backup_dirs = list_backup_dirs_newest_first()?
         .into_iter()
         .take(8)
@@ -1285,6 +1877,7 @@ fn inspect() -> Result<InspectState, String> {
         auth_exists: path_exists(&auth_path),
         backup_root: path_to_string(&backup_root()?),
         backup_dirs,
+        provider_choices,
         config: config_text.as_deref().map(parse_config),
         runtime: runtime_status(),
     })

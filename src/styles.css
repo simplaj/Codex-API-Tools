@@ -176,7 +176,7 @@ p {
 .control-strip {
   margin-top: 18px;
   display: grid;
-  grid-template-columns: minmax(180px, 260px) max-content max-content;
+  grid-template-columns: minmax(160px, 230px) minmax(160px, 230px) max-content max-content;
   gap: 12px;
   align-items: end;
 }
@@ -319,6 +319,32 @@ select:focus {
   display: grid;
   grid-template-columns: 0.88fr 1.12fr;
   gap: 16px;
+}
+
+.attention-section {
+  background: #fffaf2;
+  border-color: #efd5ae;
+}
+
+.close-confirm {
+  margin-top: 16px;
+  display: flex;
+  grid-template-columns: none;
+  align-items: flex-start;
+  gap: 10px;
+  color: #2b3a32;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.close-confirm input {
+  width: 18px;
+  min-width: 18px;
+  height: 18px;
+  min-height: 18px;
+  margin: 1px 0 0;
+  padding: 0;
+  accent-color: #244536;
 }
 
 .step-block {

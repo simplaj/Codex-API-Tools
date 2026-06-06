@@ -8,7 +8,7 @@
     "dev:frontend": "vite --host 127.0.0.1",
     "build": "vite build",
     "start": "node scripts/tauri-run.mjs dev",
-    "tauri": "tauri",
+    "tauri": "node scripts/tauri-run.mjs",
     "dist": "node scripts/tauri-run.mjs build",
     "dist:mac": "node scripts/tauri-run.mjs build --bundles dmg,app",
     "dist:win": "node scripts/tauri-run.mjs build --bundles nsis",

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
+  AlertTriangle,
   Archive,
   CheckCircle2,
   DatabaseZap,
@@ -24,6 +25,7 @@ const previewState = {
   authExists: true,
   backupRoot: "",
   backupDirs: [],
+  providerChoices: ["simplaj", "openai"],
   config: {
     rootProvider: "simplaj",
     providers: [
@@ -160,15 +162,29 @@ export default function App() {
   const [tokenCandidates, setTokenCandidates] = useState([]);
   const [logs, setLogs] = useState([]);
   const [busy, setBusy] = useState("");
+  const [codexClosedForWrite, setCodexClosedForWrite] = useState(false);
 
   const providers = state?.config?.providers || [];
   const rootProvider = state?.config?.rootProvider || "";
+  const providerChoices = useMemo(() => {
+    const choices = new Set([
+      ...(state?.providerChoices || []),
+      ...providers.map((provider) => provider.id),
+      rootProvider,
+      "simplaj"
+    ].filter(Boolean));
+    return [...choices].sort((left, right) => {
+      if (left === rootProvider) return -1;
+      if (right === rootProvider) return 1;
+      return left.localeCompare(right);
+    });
+  }, [state?.providerChoices, providers, rootProvider]);
   const openAIProvider = useMemo(() => (
     providers.find((provider) => (
       provider.id.toLowerCase() === "openai" || String(provider.name).toLowerCase() === "openai"
     ))
   ), [providers]);
-  const selectedProviderValue = selectedProvider || rootProvider || providers[0]?.id || "simplaj";
+  const selectedProviderValue = selectedProvider || rootProvider || providerChoices[0] || providers[0]?.id || "simplaj";
 
   async function refresh() {
     const nextState = await api.inspect();
@@ -215,6 +231,7 @@ export default function App() {
   const runtimeTone = state?.runtime?.nodeRequiredForSync ? "warn" : "ok";
   const canUseConfig = Boolean(state?.configExists);
   const isBusy = Boolean(busy);
+  const canWriteCodexState = codexClosedForWrite && canUseConfig;
 
   return (
     <main className="app-shell">
@@ -241,6 +258,27 @@ export default function App() {
 
       <div className="workspace-grid">
         <section className="main-flow">
+          <section className="tool-section attention-section">
+            <div className="section-title">
+              <AlertTriangle size={19} />
+              <span>写入前确认</span>
+              <StatusPill tone={codexClosedForWrite ? "ok" : "warn"}>
+                {codexClosedForWrite ? "可写入" : "需关闭 Codex"}
+              </StatusPill>
+            </div>
+            <label className="close-confirm">
+              <input
+                type="checkbox"
+                checked={codexClosedForWrite}
+                onChange={(event) => setCodexClosedForWrite(event.target.checked)}
+              />
+              <span>已完全退出 Codex App、Codex CLI 和 app-server，可以写入配置与历史索引。</span>
+            </label>
+            <p className="step-note">
+              顺序：关闭 Codex 后备份/移除 auth.json；重新打开 Codex 登录 GPT；登录完成后再次关闭 Codex，再回来写入 key 并同步。
+            </p>
+          </section>
+
           <section className="tool-section">
             <div className="section-title">
               <DatabaseZap size={19} />
@@ -252,9 +290,17 @@ export default function App() {
                 <span>新 Provider 名称</span>
                 <input value={customName} onChange={(event) => setCustomName(event.target.value)} placeholder="simplaj" />
               </label>
+              <label>
+                <span>同步目标 Provider</span>
+                <select value={selectedProviderValue} onChange={(event) => setSelectedProvider(event.target.value)}>
+                  {providerChoices.map((providerId) => (
+                    <option key={providerId} value={providerId}>{providerId}</option>
+                  ))}
+                </select>
+              </label>
               <button
                 className="primary-button"
-                disabled={!canUseConfig || isBusy}
+                disabled={!canWriteCodexState || isBusy}
                 onClick={() => runAction("重命名 Provider 并同步聊天记录", async () => {
                   const result = await api.repairProvider({ customName, runSync: true });
                   return {
@@ -270,7 +316,7 @@ export default function App() {
               </button>
               <button
                 className="secondary-button"
-                disabled={!canUseConfig || isBusy}
+                disabled={!canWriteCodexState || isBusy}
                 onClick={() => runAction("仅运行原生同步", async () => {
                   const result = await api.runProviderSync({ command: "sync", providerId: selectedProviderValue });
                   return formatOutput(result);
@@ -281,6 +327,12 @@ export default function App() {
               </button>
             </div>
             <ProviderTable providers={providers} rootProvider={rootProvider} />
+            {!codexClosedForWrite ? (
+              <div className="warning-box">
+                <AlertTriangle size={16} />
+                <span>同步会写入 state_5.sqlite、会话 rollout 和项目缓存。请先完全关闭 Codex。</span>
+              </div>
+            ) : null}
           </section>
 
           <section className="tool-section">
@@ -297,13 +349,13 @@ export default function App() {
                 </div>
                 <button
                   className="secondary-button full"
-                  disabled={isBusy}
+                  disabled={isBusy || !codexClosedForWrite}
                   onClick={() => runAction("备份并移除 auth.json", () => api.backupAndRemoveAuth())}
                 >
                   <Archive size={17} />
                   执行备份移除
                 </button>
-                <p className="step-note">完成后重启 Codex App，并登录 GPT 账号；需要远程控制时使用和手机一致的账号。</p>
+                <p className="step-note">执行前关闭 Codex。完成后打开 Codex 登录 GPT 账号；需要远程控制时使用和手机一致的账号。登录完成后再次关闭 Codex。</p>
               </div>
 
               <div className="step-block">
@@ -315,10 +367,9 @@ export default function App() {
                   <label>
                     <span>目标 Provider</span>
                     <select value={selectedProviderValue} onChange={(event) => setSelectedProvider(event.target.value)}>
-                      {providers.map((provider) => (
-                        <option key={provider.id} value={provider.id}>{provider.id}</option>
+                      {providerChoices.map((providerId) => (
+                        <option key={providerId} value={providerId}>{providerId}</option>
                       ))}
-                      {!providers.length ? <option value="simplaj">simplaj</option> : null}
                     </select>
                   </label>
                   <div className="candidate-row">
@@ -345,7 +396,7 @@ export default function App() {
                   ) : null}
                   <button
                     className="primary-button full"
-                    disabled={isBusy || (!selectedCandidate && !manualToken)}
+                    disabled={isBusy || !codexClosedForWrite || (!selectedCandidate && !manualToken)}
                     onClick={() => runAction("写入 experimental_bearer_token", () => api.applyExperimentalToken({
                       providerId: selectedProviderValue,
                       candidateId: selectedCandidate || undefined,
@@ -356,7 +407,7 @@ export default function App() {
                     写入 token
                   </button>
                 </div>
-                <p className="step-note">写入后重启 Codex App，让远程控制和插件能力读取新的 provider 认证。</p>
+                <p className="step-note">只在 GPT 登录完成且 Codex 已关闭时写入。写入后再启动 Codex App，让远程控制和插件能力读取新的 provider 认证。</p>
               </div>
             </div>
           </section>
@@ -380,6 +431,7 @@ export default function App() {
             </div>
             <dl className="facts">
               <div><dt>当前 Provider</dt><dd>{rootProvider || "-"}</dd></div>
+              <div><dt>可同步 Provider</dt><dd>{providerChoices.length}</dd></div>
               <div><dt>同步引擎</dt><dd>{state?.runtime?.syncEngine || state?.runtime?.syncPackage || "native-rust-rusqlite"}</dd></div>
               <div><dt>Node/npx</dt><dd>打包应用不需要</dd></div>
               <div><dt>Tauri 后端</dt><dd>Rust</dd></div>

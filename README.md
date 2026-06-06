@@ -6,7 +6,7 @@ Windows/macOS desktop toolbox for Codex provider repair, history synchronization
 
 - Detects a Codex provider whose id or `name` is `OpenAI`.
 - Renames that provider to a custom id/name, defaulting to `simplaj`.
-- Syncs Codex history metadata with the built-in Rust/rusqlite engine, following the key behavior of `Dailin521/codex-provider-sync` without requiring `npx`.
+- Syncs Codex history metadata with the built-in Rust/rusqlite engine, following the key behavior of `Dailin521/codex-provider-sync` without requiring `npx`: rollout metadata, `state_5.sqlite`, user-event/cwd repair, and `.codex-global-state.json` workspace-root cache repair.
 - Backs up and removes `~/.codex/auth.json` for the remote/plugin login flow.
 - Writes `experimental_bearer_token = "sk-..."` into a selected `[model_providers.NAME]` section.
 - Backs up touched files under `~/.codex/backups_state/gpt-api-tools/<timestamp>`.
@@ -14,10 +14,15 @@ Windows/macOS desktop toolbox for Codex provider repair, history synchronization
 ## User Flow
 
 1. Open the app and refresh the current `~/.codex` state.
-2. Run "one-click repair and sync" to rename the OpenAI provider to `simplaj` or another custom provider name.
-3. Back up and remove `auth.json`, then restart Codex App and sign in with the GPT account that should unlock remote control/plugin features.
-4. Load the backed-up Simplaj API key or enter one manually, then write it as `experimental_bearer_token` under the target provider.
-5. Restart Codex App again so the new provider/auth combination is picked up.
+2. Fully quit Codex App, Codex CLI, and app-server, then tick "already closed Codex" in the app.
+3. Run "one-click repair and sync" to rename the OpenAI provider to `simplaj` or another custom provider name and sync historical chat metadata to the selected provider.
+4. For remote/plugin unlock, keep Codex closed and run "backup and remove auth.json".
+5. Start Codex App and sign in with the GPT account that should unlock remote control/plugin features. Use the same account as the phone if remote control is needed.
+6. After GPT login finishes, fully quit Codex again.
+7. Load the backed-up Simplaj API key or enter one manually, then write it as `experimental_bearer_token` under the target provider.
+8. Restart Codex App so the new provider/auth combination is picked up.
+
+Do not write `config.toml`, `state_5.sqlite`, rollout files, or `.codex-global-state.json` while Codex is running. Codex can keep SQLite locked or rewrite `config.toml` on exit, which may hide histories again or discard the injected token.
 
 ## Runtime Requirements
 

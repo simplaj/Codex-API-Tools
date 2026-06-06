@@ -5,15 +5,19 @@ import path from "node:path";
 const args = process.argv.slice(2);
 const npmBin = process.platform === "win32" ? "npx.cmd" : "npx";
 const targetDir = path.join(os.tmpdir(), "gpt-api-tools-tauri-target");
+const env = {
+  ...process.env,
+  COPYFILE_DISABLE: "1"
+};
+
+if (!env.CARGO_TARGET_DIR && !env.GITHUB_ACTIONS) {
+  env.CARGO_TARGET_DIR = targetDir;
+}
 
 const child = spawn(npmBin, ["tauri", ...args], {
   stdio: "inherit",
-  env: {
-    ...process.env,
-    COPYFILE_DISABLE: "1",
-    CARGO_TARGET_DIR: process.env.CARGO_TARGET_DIR || targetDir
-  },
-  shell: false
+  env,
+  shell: process.platform === "win32"
 });
 
 child.on("exit", (code, signal) => {

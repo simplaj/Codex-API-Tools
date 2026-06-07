@@ -26,6 +26,7 @@ const previewState = {
   authExists: true,
   codexRunning: false,
   codexProcesses: [],
+  codexProcessDetectionError: null,
   backupRoot: "",
   backupDirs: [],
   providerChoices: ["simplaj", "openai"],
@@ -122,10 +123,11 @@ function formatOutput(result) {
   return parts.filter(Boolean).join("\n\n");
 }
 
-function ProviderTable({ providers = [], rootProvider }) {
+function ProviderTable({ providers = [], rootProvider, maxRows = 4 }) {
   if (!providers.length) {
     return <div className="empty-line">未读取到 model_providers 配置。</div>;
   }
+  const visibleProviders = providers.slice(0, maxRows);
   return (
     <div className="provider-table">
       <div className="provider-row provider-row-head">
@@ -134,7 +136,7 @@ function ProviderTable({ providers = [], rootProvider }) {
         <span>Wire</span>
         <span>Token</span>
       </div>
-      {providers.map((provider) => (
+      {visibleProviders.map((provider) => (
         <div className="provider-row" key={provider.id}>
           <span className="provider-id">
             {provider.id}
@@ -145,12 +147,29 @@ function ProviderTable({ providers = [], rootProvider }) {
           <span>{provider.hasExperimentalBearerToken ? provider.experimentalBearerTokenMasked : "未写入"}</span>
         </div>
       ))}
+      {providers.length > maxRows ? (
+        <div className="provider-row provider-row-more">
+          <span>另有 {providers.length - maxRows} 个 provider</span>
+          <span />
+          <span />
+          <span />
+        </div>
+      ) : null}
     </div>
   );
 }
 
 function StatusPill({ tone = "neutral", children }) {
   return <span className={`status-pill ${tone}`}>{children}</span>;
+}
+
+function ViewTab({ active, icon, label, onClick }) {
+  return (
+    <button className={active ? "active" : ""} onClick={onClick}>
+      {icon}
+      <span>{label}</span>
+    </button>
+  );
 }
 
 function LogPanel({ logs, onClear }) {
@@ -169,6 +188,7 @@ function LogPanel({ logs, onClear }) {
 export default function App() {
   const [state, setState] = useState(null);
   const [customName, setCustomName] = useState("simplaj");
+  const [activeView, setActiveView] = useState("sync");
   const [selectedProvider, setSelectedProvider] = useState("");
   const [manualToken, setManualToken] = useState("");
   const [selectedCandidate, setSelectedCandidate] = useState("");
@@ -198,13 +218,16 @@ export default function App() {
     ))
   ), [providers]);
   const selectedProviderValue = selectedProvider || rootProvider || providerChoices[0] || providers[0]?.id || "simplaj";
-  const currentSyncProvider = rootProvider || selectedProviderValue || "simplaj";
+  const targetProviderName = customName.trim() || "simplaj";
 
   async function refresh() {
     const nextState = await api.inspect();
     setState(nextState);
     if (!selectedProvider && nextState?.config?.rootProvider) {
       setSelectedProvider(nextState.config.rootProvider);
+    }
+    if (nextState?.codexRunning || nextState?.codexProcessDetectionError) {
+      setCodexClosedForWrite(false);
     }
   }
 
@@ -243,6 +266,7 @@ export default function App() {
   }
 
   async function requestCodexQuit() {
+    setCodexClosedForWrite(false);
     return runAction("尝试退出 Codex", async () => {
       const result = await api.tryQuitCodex();
       setCodexClosedForWrite(!result.stillRunning);
@@ -253,8 +277,256 @@ export default function App() {
   const runtimeTone = state?.runtime?.nodeRequiredForSync ? "warn" : "ok";
   const canUseConfig = Boolean(state?.configExists);
   const isBusy = Boolean(busy);
-  const codexRunning = Boolean(state?.codexRunning);
+  const detectionError = state?.codexProcessDetectionError || "";
+  const codexRunning = Boolean(state?.codexRunning || detectionError);
   const canWriteCodexState = codexClosedForWrite && !codexRunning && canUseConfig;
+  const writeStatusText = detectionError
+    ? "检测失败"
+    : codexRunning
+      ? `检测到 ${state?.codexProcesses?.length || 0} 个进程`
+      : "未检测到进程";
+  const visibleView = activeView === "remote" ? "remote" : activeView === "status" ? "status" : "sync";
+
+  const writeGuard = (
+    <section className="tool-section attention-section guard-panel">
+      <div className="section-title">
+        <AlertTriangle size={18} />
+        <span>写入前确认</span>
+        <StatusPill tone={canWriteCodexState ? "ok" : "warn"}>
+          {canWriteCodexState ? "可写入" : "需关闭 Codex"}
+        </StatusPill>
+      </div>
+      <div className="close-actions">
+        <button className="secondary-button" disabled={isBusy} onClick={requestCodexQuit}>
+          {busy === "尝试退出 Codex" ? <Loader2 className="spin" size={17} /> : <Power size={17} />}
+          尝试退出 Codex
+        </button>
+        <StatusPill tone={codexRunning ? "warn" : "ok"}>{writeStatusText}</StatusPill>
+      </div>
+      <label className="close-confirm">
+        <input
+          type="checkbox"
+          checked={codexClosedForWrite}
+          onChange={(event) => setCodexClosedForWrite(event.target.checked)}
+          disabled={codexRunning}
+        />
+        <span>已完全退出 Codex App、Codex CLI 和 app-server，可以写入配置与历史索引。</span>
+      </label>
+      {detectionError ? (
+        <div className="warning-box compact-warning">
+          <AlertTriangle size={16} />
+          <span>无法确认 Codex 是否已退出：{detectionError}</span>
+        </div>
+      ) : null}
+      {codexRunning && state?.codexProcesses?.length ? (
+        <div className="process-list">
+          {(state.codexProcesses || []).slice(0, 4).map((process) => (
+            <div key={`${process.pid}:${process.command}`}>
+              <b>{process.pid}</b>
+              <span>{process.command}</span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </section>
+  );
+
+  const syncView = (
+    <section className="view-panel sync-view">
+      {writeGuard}
+      <section className="tool-section sync-panel">
+        <div className="section-title">
+          <DatabaseZap size={18} />
+          <span>Provider 修复与会话同步</span>
+          {openAIProvider ? <StatusPill tone="warn">检测到 OpenAI</StatusPill> : <StatusPill tone="ok">Provider 已避开 OpenAI</StatusPill>}
+        </div>
+        <div className="sync-layout">
+          <div className="sync-controls">
+            <div className="control-strip compact-strip">
+              <label>
+                <span>新 Provider 名称</span>
+                <input value={customName} onChange={(event) => setCustomName(event.target.value)} placeholder="simplaj" />
+              </label>
+              <label>
+                <span>当前 Root Provider</span>
+                <input value={rootProvider || "-"} readOnly />
+              </label>
+            </div>
+            <div className="action-row">
+              <button
+                className="primary-button"
+                disabled={!canWriteCodexState || isBusy}
+                onClick={() => runAction("重命名 Provider 并同步聊天记录", async () => {
+                  const result = await api.repairProvider({ customName: targetProviderName, runSync: true });
+                  setSelectedProvider(result.providerId);
+                  return {
+                    message: result.message,
+                    providerId: result.providerId,
+                    backupDir: result.backupDir,
+                    sync: formatOutput(result.sync)
+                  };
+                })}
+              >
+                {busy === "重命名 Provider 并同步聊天记录" ? <Loader2 className="spin" size={17} /> : <Wrench size={17} />}
+                重命名并同步
+              </button>
+              <button
+                className="secondary-button"
+                disabled={!canWriteCodexState || isBusy}
+                onClick={() => runAction("仅同步到新 Provider", async () => {
+                  const result = await api.runProviderSync({ command: "sync", providerId: targetProviderName });
+                  return formatOutput(result);
+                })}
+              >
+                <RefreshCcw size={17} />
+                仅同步到新名称
+              </button>
+            </div>
+            <p className="step-note single-line">
+              执行后会把当前 provider section 改成 {targetProviderName}，并把历史会话 metadata、SQLite 索引和项目缓存同步到这个名字。
+            </p>
+          </div>
+          <div className="provider-snapshot">
+            <div className="section-title mini-title">
+              <CheckCircle2 size={17} />
+              <span>当前配置</span>
+              <StatusPill tone="neutral">{providers.length} 个 provider</StatusPill>
+            </div>
+            <ProviderTable providers={providers} rootProvider={rootProvider} maxRows={4} />
+          </div>
+        </div>
+      </section>
+    </section>
+  );
+
+  const remoteView = (
+    <section className="view-panel remote-view">
+      {writeGuard}
+      <section className="tool-section remote-step">
+        <div className="section-title">
+          <Archive size={18} />
+          <span>1. 备份并移除 auth.json</span>
+          <StatusPill tone={state?.authExists ? "warn" : "ok"}>{state?.authExists ? "待移除" : "已移除"}</StatusPill>
+        </div>
+        <button
+          className="secondary-button full"
+          disabled={isBusy || !canWriteCodexState}
+          onClick={() => runAction("备份并移除 auth.json", () => api.backupAndRemoveAuth())}
+        >
+          <Archive size={17} />
+          执行备份移除
+        </button>
+        <p className="step-note">关闭 Codex 后执行。完成后打开 Codex 登录 GPT；需要远程控制时使用和手机一致的账号。</p>
+      </section>
+      <section className="tool-section remote-step">
+        <div className="section-title">
+          <KeyRound size={18} />
+          <span>2. 写入 experimental_bearer_token</span>
+          <StatusPill tone="neutral">{selectedProviderValue}</StatusPill>
+        </div>
+        <div className="stacked-controls">
+          <label>
+            <span>目标 Provider</span>
+            <select value={selectedProviderValue} onChange={(event) => setSelectedProvider(event.target.value)}>
+              {providerChoices.map((providerId) => (
+                <option key={providerId} value={providerId}>{providerId}</option>
+              ))}
+            </select>
+          </label>
+          <div className="candidate-row">
+            <button className="ghost-button" disabled={isBusy} onClick={loadTokenCandidates}>
+              <RefreshCcw size={16} />
+              读取备份 key
+            </button>
+            <select value={selectedCandidate} onChange={(event) => setSelectedCandidate(event.target.value)}>
+              <option value="">手动输入</option>
+              {tokenCandidates.map((candidate) => (
+                <option key={candidate.id} value={candidate.id}>
+                  {candidate.masked} · {candidate.backupDir.split(/[\\/]/).at(-1)}
+                </option>
+              ))}
+            </select>
+          </div>
+          {!selectedCandidate ? (
+            <input
+              type="password"
+              value={manualToken}
+              onChange={(event) => setManualToken(event.target.value)}
+              placeholder="sk-..."
+            />
+          ) : null}
+          <button
+            className="primary-button full"
+            disabled={isBusy || !canWriteCodexState || (!selectedCandidate && !manualToken)}
+            onClick={() => runAction("写入 experimental_bearer_token", () => api.applyExperimentalToken({
+              providerId: selectedProviderValue,
+              candidateId: selectedCandidate || undefined,
+              token: selectedCandidate ? undefined : manualToken
+            }))}
+          >
+            <KeyRound size={17} />
+            写入 token
+          </button>
+        </div>
+        <p className="step-note">登录 GPT 后再次关闭 Codex，再回来写入 key；写入后重启 Codex 生效。</p>
+      </section>
+    </section>
+  );
+
+  const statusView = (
+    <section className="view-panel status-view">
+      <section className="tool-section status-panel">
+        <div className="section-title">
+          <CheckCircle2 size={18} />
+          <span>当前状态</span>
+        </div>
+        <div className="path-list">
+          <button onClick={() => api.openPath({ targetPath: state?.configPath })} disabled={!state?.configExists}>
+            <FolderOpen size={16} />
+            <span>config.toml</span>
+          </button>
+          <button onClick={() => api.openPath({ targetPath: state?.backupRoot })} disabled={!state?.backupDirs?.length}>
+            <FolderOpen size={16} />
+            <span>工具备份目录</span>
+          </button>
+        </div>
+        <dl className="facts">
+          <div><dt>当前 Provider</dt><dd>{rootProvider || "-"}</dd></div>
+          <div><dt>可同步 Provider</dt><dd>{providerChoices.length}</dd></div>
+          <div><dt>同步引擎</dt><dd>{state?.runtime?.syncEngine || state?.runtime?.syncPackage || "native-rust-rusqlite"}</dd></div>
+          <div><dt>Node/npx</dt><dd>打包应用不需要</dd></div>
+          <div><dt>Codex 进程</dt><dd>{writeStatusText}</dd></div>
+        </dl>
+        <button
+          className="secondary-button full"
+          disabled={isBusy}
+          onClick={() => runAction("原生同步 status", async () => {
+            const result = await api.runProviderSync({ command: "status" });
+            return formatOutput(result);
+          })}
+        >
+          <TerminalSquare size={17} />
+          查看同步状态
+        </button>
+      </section>
+
+      <section className="tool-section backup-panel">
+        <div className="section-title">
+          <RotateCcw size={18} />
+          <span>最近备份</span>
+        </div>
+        <div className="backup-list">
+          {state?.backupDirs?.length ? state.backupDirs.slice(0, 6).map((dir) => (
+            <button key={dir} onClick={() => api.openPath({ targetPath: dir })}>
+              <span>{dir.split(/[\\/]/).at(-1)}</span>
+            </button>
+          )) : <div className="empty-line">暂无工具备份。</div>}
+        </div>
+      </section>
+
+      <LogPanel logs={logs} onClear={() => setLogs([])} />
+    </section>
+  );
 
   return (
     <main className="app-shell">
@@ -278,233 +550,14 @@ export default function App() {
           </button>
         </div>
       </header>
+      <nav className="view-tabs">
+        <ViewTab active={visibleView === "sync"} icon={<DatabaseZap size={17} />} label="同步修复" onClick={() => setActiveView("sync")} />
+        <ViewTab active={visibleView === "remote"} icon={<ShieldCheck size={17} />} label="远程插件" onClick={() => setActiveView("remote")} />
+        <ViewTab active={visibleView === "status"} icon={<TerminalSquare size={17} />} label="状态日志" onClick={() => setActiveView("status")} />
+      </nav>
 
-      <div className="workspace-grid">
-        <section className="main-flow">
-          <section className="tool-section attention-section">
-            <div className="section-title">
-              <AlertTriangle size={19} />
-              <span>写入前确认</span>
-              <StatusPill tone={canWriteCodexState ? "ok" : "warn"}>
-                {canWriteCodexState ? "可写入" : "需关闭 Codex"}
-              </StatusPill>
-            </div>
-            <div className="close-actions">
-              <button className="secondary-button" disabled={isBusy} onClick={requestCodexQuit}>
-                {busy === "尝试退出 Codex" ? <Loader2 className="spin" size={17} /> : <Power size={17} />}
-                尝试退出 Codex
-              </button>
-              <StatusPill tone={codexRunning ? "warn" : "ok"}>
-                {codexRunning ? `检测到 ${state?.codexProcesses?.length || 0} 个进程` : "未检测到进程"}
-              </StatusPill>
-            </div>
-            <label className="close-confirm">
-              <input
-                type="checkbox"
-                checked={codexClosedForWrite}
-                onChange={(event) => setCodexClosedForWrite(event.target.checked)}
-                disabled={codexRunning}
-              />
-              <span>已完全退出 Codex App、Codex CLI 和 app-server，可以写入配置与历史索引。</span>
-            </label>
-            {codexRunning ? (
-              <div className="process-list">
-                {(state?.codexProcesses || []).slice(0, 6).map((process) => (
-                  <div key={`${process.pid}:${process.command}`}>
-                    <b>{process.pid}</b>
-                    <span>{process.command}</span>
-                  </div>
-                ))}
-              </div>
-            ) : null}
-            <p className="step-note">
-              顺序：先退出 Codex，再重命名 provider 并同步历史；远程/插件解锁时先移除 auth.json，打开 Codex 登录 GPT，登录完成后再次退出 Codex，再回来写入 key。
-            </p>
-          </section>
-
-          <section className="tool-section">
-            <div className="section-title">
-              <DatabaseZap size={19} />
-              <span>压缩问题修复</span>
-              {openAIProvider ? <StatusPill tone="warn">检测到 OpenAI</StatusPill> : <StatusPill tone="ok">Provider 已避开 OpenAI</StatusPill>}
-            </div>
-            <div className="control-strip">
-              <label>
-                <span>新 Provider 名称</span>
-                <input value={customName} onChange={(event) => setCustomName(event.target.value)} placeholder="simplaj" />
-              </label>
-              <label>
-                <span>当前 Provider</span>
-                <input value={currentSyncProvider} readOnly />
-              </label>
-              <button
-                className="primary-button"
-                disabled={!canWriteCodexState || isBusy}
-                onClick={() => runAction("重命名 Provider 并同步聊天记录", async () => {
-                  const result = await api.repairProvider({ customName, runSync: true });
-                  setSelectedProvider(result.providerId);
-                  return {
-                    message: result.message,
-                    providerId: result.providerId,
-                    backupDir: result.backupDir,
-                    sync: formatOutput(result.sync)
-                  };
-                })}
-              >
-                {busy === "重命名 Provider 并同步聊天记录" ? <Loader2 className="spin" size={17} /> : <Wrench size={17} />}
-                一键修复并同步
-              </button>
-              <button
-                className="secondary-button"
-                disabled={!canWriteCodexState || isBusy}
-                onClick={() => runAction("仅运行原生同步", async () => {
-                  const result = await api.runProviderSync({ command: "sync", providerId: currentSyncProvider });
-                  return formatOutput(result);
-                })}
-              >
-                <RefreshCcw size={17} />
-                仅同步
-              </button>
-            </div>
-            <ProviderTable providers={providers} rootProvider={rootProvider} />
-            {!codexClosedForWrite ? (
-              <div className="warning-box">
-                <AlertTriangle size={16} />
-                <span>同步会写入 state_5.sqlite、会话 rollout 和项目缓存。请先完全关闭 Codex。</span>
-              </div>
-            ) : null}
-          </section>
-
-          <section className="tool-section">
-            <div className="section-title">
-              <ShieldCheck size={19} />
-              <span>远程控制与插件解锁</span>
-              <StatusPill tone="neutral">auth 轮换</StatusPill>
-            </div>
-            <div className="step-grid">
-              <div className="step-block">
-                <div className="step-head">
-                  <Archive size={18} />
-                  <strong>1. 备份并移除 auth.json</strong>
-                </div>
-                <button
-                  className="secondary-button full"
-                  disabled={isBusy || !codexClosedForWrite}
-                  onClick={() => runAction("备份并移除 auth.json", () => api.backupAndRemoveAuth())}
-                >
-                  <Archive size={17} />
-                  执行备份移除
-                </button>
-                <p className="step-note">执行前关闭 Codex。完成后打开 Codex 登录 GPT 账号；需要远程控制时使用和手机一致的账号。登录完成后再次关闭 Codex。</p>
-              </div>
-
-              <div className="step-block">
-                <div className="step-head">
-                  <KeyRound size={18} />
-                  <strong>2. 写入 experimental_bearer_token</strong>
-                </div>
-                <div className="stacked-controls">
-                  <label>
-                    <span>目标 Provider</span>
-                    <select value={selectedProviderValue} onChange={(event) => setSelectedProvider(event.target.value)}>
-                      {providerChoices.map((providerId) => (
-                        <option key={providerId} value={providerId}>{providerId}</option>
-                      ))}
-                    </select>
-                  </label>
-                  <div className="candidate-row">
-                    <button className="ghost-button" disabled={isBusy} onClick={loadTokenCandidates}>
-                      <RefreshCcw size={16} />
-                      读取备份 key
-                    </button>
-                    <select value={selectedCandidate} onChange={(event) => setSelectedCandidate(event.target.value)}>
-                      <option value="">手动输入</option>
-                      {tokenCandidates.map((candidate) => (
-                        <option key={candidate.id} value={candidate.id}>
-                          {candidate.masked} · {candidate.backupDir.split(/[\\/]/).at(-1)}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  {!selectedCandidate ? (
-                    <input
-                      type="password"
-                      value={manualToken}
-                      onChange={(event) => setManualToken(event.target.value)}
-                      placeholder="sk-..."
-                    />
-                  ) : null}
-                  <button
-                    className="primary-button full"
-                    disabled={isBusy || !codexClosedForWrite || (!selectedCandidate && !manualToken)}
-                    onClick={() => runAction("写入 experimental_bearer_token", () => api.applyExperimentalToken({
-                      providerId: selectedProviderValue,
-                      candidateId: selectedCandidate || undefined,
-                      token: selectedCandidate ? undefined : manualToken
-                    }))}
-                  >
-                    <KeyRound size={17} />
-                    写入 token
-                  </button>
-                </div>
-                <p className="step-note">只在 GPT 登录完成且 Codex 已关闭时写入。写入后再启动 Codex App，让远程控制和插件能力读取新的 provider 认证。</p>
-              </div>
-            </div>
-          </section>
-        </section>
-
-        <aside className="side-panel">
-          <section className="status-panel">
-            <div className="section-title">
-              <CheckCircle2 size={18} />
-              <span>当前状态</span>
-            </div>
-            <div className="path-list">
-              <button onClick={() => api.openPath({ targetPath: state?.configPath })} disabled={!state?.configExists}>
-                <FolderOpen size={16} />
-                <span>config.toml</span>
-              </button>
-              <button onClick={() => api.openPath({ targetPath: state?.backupRoot })} disabled={!state?.backupDirs?.length}>
-                <FolderOpen size={16} />
-                <span>工具备份目录</span>
-              </button>
-            </div>
-            <dl className="facts">
-              <div><dt>当前 Provider</dt><dd>{rootProvider || "-"}</dd></div>
-              <div><dt>可同步 Provider</dt><dd>{providerChoices.length}</dd></div>
-              <div><dt>同步引擎</dt><dd>{state?.runtime?.syncEngine || state?.runtime?.syncPackage || "native-rust-rusqlite"}</dd></div>
-              <div><dt>Node/npx</dt><dd>打包应用不需要</dd></div>
-              <div><dt>Tauri 后端</dt><dd>Rust</dd></div>
-            </dl>
-            <button
-              className="secondary-button full"
-              disabled={isBusy}
-              onClick={() => runAction("原生同步 status", async () => {
-                const result = await api.runProviderSync({ command: "status" });
-                return formatOutput(result);
-              })}
-            >
-              <TerminalSquare size={17} />
-              查看同步状态
-            </button>
-          </section>
-
-          <section className="status-panel">
-            <div className="section-title">
-              <RotateCcw size={18} />
-              <span>最近备份</span>
-            </div>
-            <div className="backup-list">
-              {state?.backupDirs?.length ? state.backupDirs.map((dir) => (
-                <button key={dir} onClick={() => api.openPath({ targetPath: dir })}>
-                  <span>{dir.split(/[\\/]/).at(-1)}</span>
-                </button>
-              )) : <div className="empty-line">暂无工具备份。</div>}
-            </div>
-          </section>
-
-          <LogPanel logs={logs} onClear={() => setLogs([])} />
-        </aside>
+      <div className="view-host">
+        {visibleView === "remote" ? remoteView : visibleView === "status" ? statusView : syncView}
       </div>
     </main>
   );

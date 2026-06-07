@@ -4,10 +4,10 @@ Windows/macOS desktop toolbox for Codex provider repair, history synchronization
 
 ## Features
 
-- Detects a Codex provider whose id or `name` is `OpenAI`.
-- Renames that provider to a custom id/name, defaulting to `simplaj`.
-- Syncs all historical Codex session metadata to the current provider with the built-in Rust/rusqlite engine, following the key behavior of `Dailin521/codex-provider-sync` without requiring `npx`: rollout `session_meta.payload.model_provider`, `state_5.sqlite.threads.model_provider`, user-event/cwd repair, and `.codex-global-state.json` workspace-root cache repair.
-- Detects running Codex App / Codex CLI / app-server processes before writes, can request Codex App to quit, and blocks state writes until Codex is fully closed.
+- Detects a Codex provider whose id or `name` is `OpenAI`; if none exists, uses the current root provider section.
+- Renames that provider section to the new provider id/name, defaulting to `simplaj`.
+- Syncs all historical Codex session metadata to the same new provider name with the built-in Rust/rusqlite engine, following the key behavior of `Dailin521/codex-provider-sync` without requiring `npx`: rollout `session_meta.payload.model_provider`, `state_5.sqlite.threads.model_provider`, user-event/cwd repair, and `.codex-global-state.json` workspace-root cache repair.
+- Detects running Codex App / Codex CLI / app-server processes before writes, can request Codex App to quit, and blocks state writes until Codex is fully closed. If process detection itself fails, writes are blocked and the user is asked to quit Codex manually before retrying.
 - Backs up and removes `~/.codex/auth.json` for the remote/plugin login flow.
 - Writes `experimental_bearer_token = "sk-..."` into a selected `[model_providers.NAME]` section.
 - Backs up touched files under `~/.codex/backups_state/gpt-api-tools/<timestamp>`.
@@ -17,19 +17,19 @@ Windows/macOS desktop toolbox for Codex provider repair, history synchronization
 1. Open the app and refresh the current `~/.codex` state.
 2. Click "try quit Codex", or fully quit Codex App, Codex CLI, and app-server manually.
 3. After the app reports no Codex processes, tick "already closed Codex" in the app.
-4. Run "one-click repair and sync" to rename the OpenAI provider to `simplaj` or another custom provider name and sync every historical chat metadata record to that provider.
-5. If the OpenAI provider was already renamed earlier, run "sync only"; it syncs histories to the current root provider in `config.toml`.
+4. Run "rename and sync" to rename the OpenAI provider, or the current root provider if OpenAI is already gone, to `simplaj` or another custom provider name. The same action syncs every historical chat metadata record to that new provider name.
+5. If the provider section is already named correctly, "sync only to new name" still syncs histories to the provider name typed in the app.
 6. For remote/plugin unlock, keep Codex closed and run "backup and remove auth.json".
 7. Start Codex App and sign in with the GPT account that should unlock remote control/plugin features. Use the same account as the phone if remote control is needed.
 8. After GPT login finishes, fully quit Codex again.
 9. Load the backed-up Simplaj API key or enter one manually, then write it as `experimental_bearer_token` under the target provider.
 10. Restart Codex App so the new provider/auth combination is picked up.
 
-Do not write `config.toml`, `state_5.sqlite`, rollout files, or `.codex-global-state.json` while Codex is running. Codex can keep SQLite locked or rewrite `config.toml` on exit, which may hide histories again or discard the injected token. The app enforces this in the backend for provider repair, metadata sync, `auth.json` removal, and token writing.
+Do not write `config.toml`, `state_5.sqlite`, rollout files, or `.codex-global-state.json` while Codex is running. Codex can keep SQLite locked or rewrite `config.toml` on exit, which may hide histories again or discard the injected token. The app enforces this in the backend for provider repair, metadata sync, `auth.json` removal, and token writing, and fails closed if it cannot confirm the Codex process state.
 
 ## Sync Semantics
 
-The sync flow mirrors `codex-provider-sync sync`: it does not switch ChatGPT login state and does not rewrite message history. It only updates visibility metadata so histories belonging to older provider names become visible under the current provider:
+The sync flow mirrors `codex-provider-sync sync`: it does not switch ChatGPT login state and does not rewrite message history. It only updates visibility metadata so histories belonging to older provider names become visible under the target provider name selected in the app:
 
 - `~/.codex/sessions/**/rollout-*.jsonl`
 - `~/.codex/archived_sessions/**/rollout-*.jsonl`

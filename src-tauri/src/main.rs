@@ -75,6 +75,7 @@ struct InspectState {
     auth_exists: bool,
     codex_running: bool,
     codex_processes: Vec<CodexProcess>,
+    codex_process_detection_error: Option<String>,
     backup_root: String,
     backup_dirs: Vec<String>,
     provider_choices: Vec<String>,
@@ -602,6 +603,25 @@ fn find_openai_provider_section(sections: &[ProviderSection]) -> Option<Provider
                     .unwrap_or(false)
         })
         .cloned()
+}
+
+fn find_provider_section_for_repair(
+    sections: &[ProviderSection],
+    current_provider: &str,
+) -> Option<ProviderSection> {
+    find_openai_provider_section(sections).or_else(|| {
+        sections
+            .iter()
+            .find(|section| {
+                section.id == current_provider
+                    || section
+                        .values
+                        .get("name")
+                        .map(|name| name == current_provider)
+                        .unwrap_or(false)
+            })
+            .cloned()
+    })
 }
 
 fn state_db_path(codex_home: &Path) -> PathBuf {
@@ -1842,7 +1862,7 @@ fn runtime_status() -> RuntimeStatus {
     }
 }
 
-fn detect_codex_processes() -> Vec<CodexProcess> {
+fn detect_codex_processes() -> Result<Vec<CodexProcess>, String> {
     let current_pid = process::id();
     let output = if cfg!(windows) {
         Command::new("powershell")
@@ -1856,11 +1876,18 @@ fn detect_codex_processes() -> Vec<CodexProcess> {
         Command::new("ps").args(["-axo", "pid=,args="]).output()
     };
 
-    let Ok(output) = output else {
-        return Vec::new();
-    };
+    let output = output.map_err(|error| format!("无法执行 Codex 进程检测命令：{error}"))?;
     if !output.status.success() {
-        return Vec::new();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("退出码 {:?}", output.status.code())
+        };
+        return Err(format!("Codex 进程检测命令失败：{detail}"));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1895,7 +1922,7 @@ fn detect_codex_processes() -> Vec<CodexProcess> {
         processes.push(CodexProcess { pid, command });
     }
     processes.sort_by(|left, right| left.pid.cmp(&right.pid));
-    processes
+    Ok(processes)
 }
 
 fn is_codex_process_command(command: &str) -> bool {
@@ -1953,7 +1980,9 @@ fn run_quit_codex_commands() -> Vec<String> {
 }
 
 fn ensure_codex_stopped_for_write(action: &str) -> Result<(), String> {
-    let processes = detect_codex_processes();
+    let processes = detect_codex_processes().map_err(|error| {
+        format!("{action} 前无法确认 Codex 是否已完全退出。请手动关闭 Codex App、Codex CLI 和 app-server 后重试。检测错误：{error}")
+    })?;
     if processes.is_empty() {
         return Ok(());
     }
@@ -2019,7 +2048,10 @@ fn inspect() -> Result<InspectState, String> {
         .take(8)
         .map(|path| path_to_string(&path))
         .collect();
-    let codex_processes = detect_codex_processes();
+    let (codex_processes, codex_process_detection_error) = match detect_codex_processes() {
+        Ok(processes) => (processes, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
 
     Ok(InspectState {
         codex_home: path_to_string(&codex_home),
@@ -2027,8 +2059,9 @@ fn inspect() -> Result<InspectState, String> {
         auth_path: path_to_string(&auth_path),
         config_exists: config_text.is_some(),
         auth_exists: path_exists(&auth_path),
-        codex_running: !codex_processes.is_empty(),
+        codex_running: codex_process_detection_error.is_some() || !codex_processes.is_empty(),
         codex_processes,
+        codex_process_detection_error,
         backup_root: path_to_string(&backup_root()?),
         backup_dirs,
         provider_choices,
@@ -2078,48 +2111,35 @@ fn repair_provider(
     let config_path = config_path()?;
     let config_text = fs::read_to_string(&config_path).map_err(command_error)?;
     let sections = parse_provider_sections(&config_text);
-    let openai_section = find_openai_provider_section(&sections);
+    let current_provider = parse_root_provider(&config_text);
+    let mut target_section = find_provider_section_for_repair(&sections, &current_provider)
+        .ok_or_else(|| {
+            format!(
+                "config.toml 里没有找到 OpenAI provider，也没有找到当前 provider {current_provider} 对应的 [model_providers.*] section。请先确认 config.toml。"
+            )
+        })?;
+    let previous_provider_id = target_section.id.clone();
+    let previous_provider_name = target_section
+        .values
+        .get("name")
+        .cloned()
+        .unwrap_or_else(|| previous_provider_id.clone());
 
-    if openai_section.is_none() {
-        let current_provider = parse_root_provider(&config_text);
-        let sync_provider_id = if current_provider.trim().is_empty() {
-            provider_id.clone()
-        } else {
-            current_provider
-        };
-        let sync = if run_sync.unwrap_or(true) {
-            Some(run_provider_sync(
-                Some("sync".into()),
-                Some(sync_provider_id.clone()),
-            )?)
-        } else {
-            None
-        };
-        return Ok(RepairResult {
-            changed: false,
-            provider_id: sync_provider_id,
-            backup_dir: None,
-            message: "config.toml 里没有找到 name/id 为 OpenAI 的 provider，已按当前 provider 执行 metadata 同步。".into(),
-            sync,
-        });
-    }
-
-    let mut openai_section = openai_section.unwrap();
     if sections
         .iter()
-        .any(|section| section.id == provider_id && section.start != openai_section.start)
+        .any(|section| section.id == provider_id && section.start != target_section.start)
     {
         return Err(format!(
             "config.toml 已存在 [model_providers.{provider_id}]，为避免覆盖没有自动合并。"
         ));
     }
 
-    let backup = create_backup(&[config_path.clone()], "repair-openai-provider-name")?;
+    let backup = create_backup(&[config_path.clone()], "repair-provider-name")?;
     let mut lines = split_lines(&config_text);
-    lines[openai_section.start] = format!("[model_providers.{provider_id}]");
+    lines[target_section.start] = format!("[model_providers.{provider_id}]");
     upsert_key_in_section(
         &mut lines,
-        &mut openai_section,
+        &mut target_section,
         "name",
         &format!("\"{}\"", escape_toml_string(&provider_id)),
     );
@@ -2140,7 +2160,9 @@ fn repair_provider(
         changed: true,
         provider_id: provider_id.clone(),
         backup_dir: Some(backup.backup_dir),
-        message: format!("已将 OpenAI provider 重命名为 {provider_id}。"),
+        message: format!(
+            "已将 provider {previous_provider_id} / {previous_provider_name} 重命名为 {provider_id}，并将 root provider 指向 {provider_id}。"
+        ),
         sync,
     })
 }
@@ -2269,7 +2291,9 @@ fn apply_experimental_token(
 
 #[tauri::command]
 fn try_quit_codex() -> Result<QuitCodexResult, String> {
-    let before = detect_codex_processes();
+    let before = detect_codex_processes().map_err(|error| {
+        format!("无法检测 Codex 是否正在运行。请手动完全关闭 Codex 后再重试。检测错误：{error}")
+    })?;
     if before.is_empty() {
         return Ok(QuitCodexResult {
             attempted: false,
@@ -2282,7 +2306,9 @@ fn try_quit_codex() -> Result<QuitCodexResult, String> {
 
     let commands = run_quit_codex_commands();
     sleep(Duration::from_millis(1800));
-    let processes = detect_codex_processes();
+    let processes = detect_codex_processes().map_err(|error| {
+        format!("已尝试退出 Codex，但无法确认是否已完全退出。请手动完全关闭 Codex 后再写入。检测错误：{error}")
+    })?;
     let still_running = !processes.is_empty();
     let message = if still_running {
         format!(

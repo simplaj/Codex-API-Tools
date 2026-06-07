@@ -8,6 +8,7 @@ import {
   FolderOpen,
   KeyRound,
   Loader2,
+  Power,
   RefreshCcw,
   RotateCcw,
   ShieldCheck,
@@ -23,6 +24,8 @@ const previewState = {
   authPath: "",
   configExists: true,
   authExists: true,
+  codexRunning: false,
+  codexProcesses: [],
   backupRoot: "",
   backupDirs: [],
   providerChoices: ["simplaj", "openai"],
@@ -82,6 +85,15 @@ async function callTauri(command, args) {
   if (command === "apply_experimental_token") {
     return { applied: true, providerId: args?.providerId || "simplaj", tokenMasked: "sk-...demo", backupDir: "preview" };
   }
+  if (command === "try_quit_codex") {
+    return {
+      attempted: false,
+      commands: [],
+      stillRunning: false,
+      processes: [],
+      message: "Preview mode: 未检测到 Codex 进程。"
+    };
+  }
   return { opened: false };
 }
 
@@ -91,6 +103,7 @@ const api = {
   runProviderSync: ({ command, providerId } = {}) => callTauri("run_provider_sync", { command, providerId }),
   backupAndRemoveAuth: () => callTauri("backup_remove_auth"),
   listAuthTokenCandidates: () => callTauri("list_auth_token_candidates"),
+  tryQuitCodex: () => callTauri("try_quit_codex"),
   applyExperimentalToken: ({ providerId, candidateId, token }) => callTauri("apply_experimental_token", {
     providerId,
     candidateId,
@@ -185,6 +198,7 @@ export default function App() {
     ))
   ), [providers]);
   const selectedProviderValue = selectedProvider || rootProvider || providerChoices[0] || providers[0]?.id || "simplaj";
+  const currentSyncProvider = rootProvider || selectedProviderValue || "simplaj";
 
   async function refresh() {
     const nextState = await api.inspect();
@@ -228,10 +242,19 @@ export default function App() {
     });
   }
 
+  async function requestCodexQuit() {
+    return runAction("尝试退出 Codex", async () => {
+      const result = await api.tryQuitCodex();
+      setCodexClosedForWrite(!result.stillRunning);
+      return result;
+    });
+  }
+
   const runtimeTone = state?.runtime?.nodeRequiredForSync ? "warn" : "ok";
   const canUseConfig = Boolean(state?.configExists);
   const isBusy = Boolean(busy);
-  const canWriteCodexState = codexClosedForWrite && canUseConfig;
+  const codexRunning = Boolean(state?.codexRunning);
+  const canWriteCodexState = codexClosedForWrite && !codexRunning && canUseConfig;
 
   return (
     <main className="app-shell">
@@ -262,8 +285,17 @@ export default function App() {
             <div className="section-title">
               <AlertTriangle size={19} />
               <span>写入前确认</span>
-              <StatusPill tone={codexClosedForWrite ? "ok" : "warn"}>
-                {codexClosedForWrite ? "可写入" : "需关闭 Codex"}
+              <StatusPill tone={canWriteCodexState ? "ok" : "warn"}>
+                {canWriteCodexState ? "可写入" : "需关闭 Codex"}
+              </StatusPill>
+            </div>
+            <div className="close-actions">
+              <button className="secondary-button" disabled={isBusy} onClick={requestCodexQuit}>
+                {busy === "尝试退出 Codex" ? <Loader2 className="spin" size={17} /> : <Power size={17} />}
+                尝试退出 Codex
+              </button>
+              <StatusPill tone={codexRunning ? "warn" : "ok"}>
+                {codexRunning ? `检测到 ${state?.codexProcesses?.length || 0} 个进程` : "未检测到进程"}
               </StatusPill>
             </div>
             <label className="close-confirm">
@@ -271,11 +303,22 @@ export default function App() {
                 type="checkbox"
                 checked={codexClosedForWrite}
                 onChange={(event) => setCodexClosedForWrite(event.target.checked)}
+                disabled={codexRunning}
               />
               <span>已完全退出 Codex App、Codex CLI 和 app-server，可以写入配置与历史索引。</span>
             </label>
+            {codexRunning ? (
+              <div className="process-list">
+                {(state?.codexProcesses || []).slice(0, 6).map((process) => (
+                  <div key={`${process.pid}:${process.command}`}>
+                    <b>{process.pid}</b>
+                    <span>{process.command}</span>
+                  </div>
+                ))}
+              </div>
+            ) : null}
             <p className="step-note">
-              顺序：关闭 Codex 后备份/移除 auth.json；重新打开 Codex 登录 GPT；登录完成后再次关闭 Codex，再回来写入 key 并同步。
+              顺序：先退出 Codex，再重命名 provider 并同步历史；远程/插件解锁时先移除 auth.json，打开 Codex 登录 GPT，登录完成后再次退出 Codex，再回来写入 key。
             </p>
           </section>
 
@@ -291,18 +334,15 @@ export default function App() {
                 <input value={customName} onChange={(event) => setCustomName(event.target.value)} placeholder="simplaj" />
               </label>
               <label>
-                <span>同步目标 Provider</span>
-                <select value={selectedProviderValue} onChange={(event) => setSelectedProvider(event.target.value)}>
-                  {providerChoices.map((providerId) => (
-                    <option key={providerId} value={providerId}>{providerId}</option>
-                  ))}
-                </select>
+                <span>当前 Provider</span>
+                <input value={currentSyncProvider} readOnly />
               </label>
               <button
                 className="primary-button"
                 disabled={!canWriteCodexState || isBusy}
                 onClick={() => runAction("重命名 Provider 并同步聊天记录", async () => {
                   const result = await api.repairProvider({ customName, runSync: true });
+                  setSelectedProvider(result.providerId);
                   return {
                     message: result.message,
                     providerId: result.providerId,
@@ -318,7 +358,7 @@ export default function App() {
                 className="secondary-button"
                 disabled={!canWriteCodexState || isBusy}
                 onClick={() => runAction("仅运行原生同步", async () => {
-                  const result = await api.runProviderSync({ command: "sync", providerId: selectedProviderValue });
+                  const result = await api.runProviderSync({ command: "sync", providerId: currentSyncProvider });
                   return formatOutput(result);
                 })}
               >

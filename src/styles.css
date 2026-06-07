@@ -347,6 +347,44 @@ select:focus {
   accent-color: #244536;
 }
 
+.close-actions {
+  margin-top: 15px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.close-actions .status-pill {
+  margin-left: 0;
+}
+
+.process-list {
+  margin-top: 12px;
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  color: #704018;
+  background: #fff4e6;
+  border: 1px solid #edcfaa;
+  border-radius: 7px;
+  font: 11px/1.45 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+.process-list div {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+}
+
+.process-list b,
+.process-list span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .step-block {
   padding: 16px;
   border: 1px solid #dce5df;

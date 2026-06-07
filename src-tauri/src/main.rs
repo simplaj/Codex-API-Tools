@@ -9,8 +9,9 @@ use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{self, Command};
 use std::sync::Mutex;
+use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{Manager, State};
 
@@ -72,6 +73,8 @@ struct InspectState {
     auth_path: String,
     config_exists: bool,
     auth_exists: bool,
+    codex_running: bool,
+    codex_processes: Vec<CodexProcess>,
     backup_root: String,
     backup_dirs: Vec<String>,
     provider_choices: Vec<String>,
@@ -155,6 +158,23 @@ struct OpenPathResult {
     opened: bool,
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CodexProcess {
+    pid: u32,
+    command: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuitCodexResult {
+    attempted: bool,
+    commands: Vec<String>,
+    still_running: bool,
+    processes: Vec<CodexProcess>,
+    message: String,
+}
+
 struct FirstLineRecord {
     first_line: String,
     separator: String,
@@ -217,6 +237,7 @@ fn main() {
             backup_remove_auth,
             list_auth_token_candidates,
             apply_experimental_token,
+            try_quit_codex,
             open_path
         ])
         .setup(|app| {
@@ -1677,6 +1698,7 @@ fn render_native_status() -> Result<String, String> {
 }
 
 fn run_native_sync(target_provider: &str) -> Result<String, String> {
+    ensure_codex_stopped_for_write("同步历史会话 metadata")?;
     let codex_home = codex_home()?;
     let scan = collect_rollout_scan(&codex_home, Some(target_provider))?;
     let cwd_stats = read_thread_cwd_stats(&codex_home)?;
@@ -1750,6 +1772,7 @@ fn run_native_sync(target_provider: &str) -> Result<String, String> {
 }
 
 fn run_native_switch(target_provider: &str) -> Result<String, String> {
+    ensure_codex_stopped_for_write("切换 provider 并同步历史会话")?;
     let config_path = config_path()?;
     let config_text = fs::read_to_string(&config_path).map_err(command_error)?;
     let backup = create_backup(&[config_path.clone()], "switch-root-provider")?;
@@ -1819,6 +1842,134 @@ fn runtime_status() -> RuntimeStatus {
     }
 }
 
+fn detect_codex_processes() -> Vec<CodexProcess> {
+    let current_pid = process::id();
+    let output = if cfg!(windows) {
+        Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }",
+            ])
+            .output()
+    } else {
+        Command::new("ps").args(["-axo", "pid=,args="]).output()
+    };
+
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut processes = Vec::new();
+    for raw_line in stdout.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let (pid, command) = if cfg!(windows) {
+            let Some((pid_text, command_text)) = line.split_once('\t') else {
+                continue;
+            };
+            let Ok(pid) = pid_text.trim().parse::<u32>() else {
+                continue;
+            };
+            (pid, command_text.trim().to_string())
+        } else {
+            let Some((pid_text, command_text)) = line.split_once(char::is_whitespace) else {
+                continue;
+            };
+            let Ok(pid) = pid_text.trim().parse::<u32>() else {
+                continue;
+            };
+            (pid, command_text.trim().to_string())
+        };
+
+        if pid == current_pid || !is_codex_process_command(&command) {
+            continue;
+        }
+        processes.push(CodexProcess { pid, command });
+    }
+    processes.sort_by(|left, right| left.pid.cmp(&right.pid));
+    processes
+}
+
+fn is_codex_process_command(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    if lower.is_empty()
+        || lower.contains("codex api tools")
+        || lower.contains("codex-api-tools")
+        || lower.contains("gpt-api-tools")
+        || lower.contains("codex computer use.app")
+        || lower.contains("skycomputeruseclient")
+    {
+        return false;
+    }
+
+    if lower.contains("/applications/codex.app/")
+        || lower.contains("\\codex.app\\")
+        || lower.contains("\\codex\\")
+        || lower.contains("codex.exe")
+    {
+        return true;
+    }
+
+    let executable = command.split_whitespace().next().unwrap_or(command);
+    let name = Path::new(executable)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(executable)
+        .to_ascii_lowercase();
+    let name = name.trim_end_matches(".exe");
+    name == "codex" && lower.contains("app-server")
+}
+
+fn run_quit_codex_commands() -> Vec<String> {
+    let mut commands = Vec::new();
+    if cfg!(target_os = "macos") {
+        let command_text = "osascript -e 'tell application \"Codex\" to quit'";
+        commands.push(command_text.to_string());
+        let _ = Command::new("osascript")
+            .args(["-e", "tell application \"Codex\" to quit"])
+            .status();
+    } else if cfg!(windows) {
+        for image in ["Codex.exe", "codex.exe"] {
+            let command_text = format!("taskkill /IM {image}");
+            commands.push(command_text);
+            let _ = Command::new("taskkill").args(["/IM", image]).status();
+        }
+    } else {
+        let command_text = "pkill -TERM -f 'codex app-server'";
+        commands.push(command_text.to_string());
+        let _ = Command::new("pkill")
+            .args(["-TERM", "-f", "codex app-server"])
+            .status();
+    }
+    commands
+}
+
+fn ensure_codex_stopped_for_write(action: &str) -> Result<(), String> {
+    let processes = detect_codex_processes();
+    if processes.is_empty() {
+        return Ok(());
+    }
+    let preview = processes
+        .iter()
+        .take(5)
+        .map(|process| format!("{} {}", process.pid, process.command))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(format!(
+        "{action} 前必须完全退出 Codex App、Codex CLI 和 app-server。当前仍检测到 {} 个相关进程：{}",
+        processes.len(),
+        preview
+    ))
+}
+
 fn collect_strings_from_json(value: &Value, output: &mut Vec<String>) {
     match value {
         Value::String(value) => output.push(value.clone()),
@@ -1868,6 +2019,7 @@ fn inspect() -> Result<InspectState, String> {
         .take(8)
         .map(|path| path_to_string(&path))
         .collect();
+    let codex_processes = detect_codex_processes();
 
     Ok(InspectState {
         codex_home: path_to_string(&codex_home),
@@ -1875,6 +2027,8 @@ fn inspect() -> Result<InspectState, String> {
         auth_path: path_to_string(&auth_path),
         config_exists: config_text.is_some(),
         auth_exists: path_exists(&auth_path),
+        codex_running: !codex_processes.is_empty(),
+        codex_processes,
         backup_root: path_to_string(&backup_root()?),
         backup_dirs,
         provider_choices,
@@ -1919,6 +2073,7 @@ fn repair_provider(
     custom_name: Option<String>,
     run_sync: Option<bool>,
 ) -> Result<RepairResult, String> {
+    ensure_codex_stopped_for_write("重命名 provider 并同步历史会话")?;
     let provider_id = sanitize_provider_id(custom_name)?;
     let config_path = config_path()?;
     let config_text = fs::read_to_string(&config_path).map_err(command_error)?;
@@ -1926,19 +2081,25 @@ fn repair_provider(
     let openai_section = find_openai_provider_section(&sections);
 
     if openai_section.is_none() {
+        let current_provider = parse_root_provider(&config_text);
+        let sync_provider_id = if current_provider.trim().is_empty() {
+            provider_id.clone()
+        } else {
+            current_provider
+        };
         let sync = if run_sync.unwrap_or(true) {
             Some(run_provider_sync(
                 Some("sync".into()),
-                Some(provider_id.clone()),
+                Some(sync_provider_id.clone()),
             )?)
         } else {
             None
         };
         return Ok(RepairResult {
             changed: false,
-            provider_id,
+            provider_id: sync_provider_id,
             backup_dir: None,
-            message: "config.toml 里没有找到 name/id 为 OpenAI 的 provider。".into(),
+            message: "config.toml 里没有找到 name/id 为 OpenAI 的 provider，已按当前 provider 执行 metadata 同步。".into(),
             sync,
         });
     }
@@ -1986,6 +2147,7 @@ fn repair_provider(
 
 #[tauri::command]
 fn backup_remove_auth() -> Result<AuthRemoveResult, String> {
+    ensure_codex_stopped_for_write("备份并移除 auth.json")?;
     let auth_path = auth_path()?;
     if !path_exists(&auth_path) {
         return Ok(AuthRemoveResult {
@@ -2060,6 +2222,7 @@ fn apply_experimental_token(
     candidate_id: Option<String>,
     cache: State<TokenCache>,
 ) -> Result<ApplyTokenResult, String> {
+    ensure_codex_stopped_for_write("写入 experimental_bearer_token")?;
     let config_path = config_path()?;
     let config_text = fs::read_to_string(&config_path).map_err(command_error)?;
     let target_provider =
@@ -2101,6 +2264,41 @@ fn apply_experimental_token(
         provider_id: target_provider,
         token_masked: mask_secret(&token_to_use),
         backup_dir: backup.backup_dir,
+    })
+}
+
+#[tauri::command]
+fn try_quit_codex() -> Result<QuitCodexResult, String> {
+    let before = detect_codex_processes();
+    if before.is_empty() {
+        return Ok(QuitCodexResult {
+            attempted: false,
+            commands: Vec::new(),
+            still_running: false,
+            processes: Vec::new(),
+            message: "未检测到 Codex App / Codex CLI / app-server，可以写入配置和历史索引。".into(),
+        });
+    }
+
+    let commands = run_quit_codex_commands();
+    sleep(Duration::from_millis(1800));
+    let processes = detect_codex_processes();
+    let still_running = !processes.is_empty();
+    let message = if still_running {
+        format!(
+            "已尝试退出 Codex，但仍检测到 {} 个相关进程。请手动完全关闭 Codex App、Codex CLI 和 app-server 后再写入。",
+            processes.len()
+        )
+    } else {
+        "已请求 Codex 退出，当前未检测到相关进程。可以勾选确认后写入。".into()
+    };
+
+    Ok(QuitCodexResult {
+        attempted: true,
+        commands,
+        still_running,
+        processes,
+        message,
     })
 }
 

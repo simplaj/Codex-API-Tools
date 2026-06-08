@@ -9,6 +9,8 @@
     "build": "vite build",
     "start": "node scripts/tauri-run.mjs dev",
     "tauri": "node scripts/tauri-run.mjs",
+    "cli": "node scripts/cargo-run.mjs run --manifest-path src-tauri/Cargo.toml --bin codex-tools --",
+    "cli:build": "node scripts/cargo-run.mjs build --manifest-path src-tauri/Cargo.toml --bin codex-tools --release",
     "dist": "node scripts/tauri-run.mjs build",
     "dist:mac": "node scripts/tauri-run.mjs build --bundles dmg,app",
     "dist:win": "node scripts/tauri-run.mjs build --bundles nsis",

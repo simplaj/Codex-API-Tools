@@ -1,0 +1,35 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "codex-tools-sync-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-08",
+  "workers_dev": true,
+  "preview_urls": false,
+  "vars": {
+    "OBJECT_PREFIX": "users",
+    "REGISTRATION_INVITE_CODE": "sub2api.simplaj.top"
+  },
+  "ratelimits": [
+    {
+      "name": "REGISTER_RATE_LIMITER",
+      "namespace_id": "5210608",
+      "simple": {
+        "limit": 10,
+        "period": 60
+      }
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "SESSION_BUCKET",
+      "bucket_name": "codex-tools"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "codex-tools-sync-prod",
+      "database_id": "db52a864-38a6-44de-a3f0-1a65deab6e88"
+    }
+  ]
+}

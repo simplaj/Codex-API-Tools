@@ -2,6 +2,50 @@
 
 Windows/macOS desktop toolbox for Codex provider repair, history synchronization, remote/plugin unlock, and OpenAI account quota checks.
 
+## Install
+
+Normal users do not need Node.js, npm, or a local Rust toolchain.
+
+Download the latest assets from GitHub Releases:
+
+- macOS desktop: install the `.dmg`.
+- Windows desktop: run the `.exe` installer.
+- macOS CLI: download `codex-tools-macos-aarch64.tar.gz` for Apple Silicon, or `codex-tools-macos-x64.tar.gz` for Intel.
+- Windows CLI: download `codex-tools-windows-x64.zip`.
+- Linux CLI: download `codex-tools-linux-x64.tar.gz`.
+
+macOS CLI install:
+
+```bash
+tar -xzf codex-tools-macos-aarch64.tar.gz
+cd codex-tools-macos-aarch64
+./codex-tools cloud login --email user@example.com
+```
+
+Optional macOS global install:
+
+```bash
+mkdir -p ~/.local/bin
+cp codex-tools ~/.local/bin/codex-tools
+chmod +x ~/.local/bin/codex-tools
+```
+
+Windows CLI install:
+
+```powershell
+Expand-Archive .\codex-tools-windows-x64.zip
+cd .\codex-tools-windows-x64
+.\codex-tools.exe cloud login --email user@example.com
+```
+
+Linux CLI install:
+
+```bash
+tar -xzf codex-tools-linux-x64.tar.gz
+cd codex-tools-linux-x64
+./codex-tools cloud login --email user@example.com
+```
+
 ## Features
 
 - Detects a Codex provider whose id or `name` is `OpenAI`; if none exists, uses the current root provider section.
@@ -12,6 +56,7 @@ Windows/macOS desktop toolbox for Codex provider repair, history synchronization
 - Writes `experimental_bearer_token = "sk-..."` into a selected `[model_providers.NAME]` section.
 - Queries the current ChatGPT login quota through OpenAI's `wham/usage` endpoint using the local Codex ChatGPT login token, showing masked account info, plan type, usage windows, reset time, credits, and a clear fallback message when the endpoint is unavailable or the login is not ChatGPT-based.
 - Can automatically comment or uncomment only the current provider's `base_url` and `experimental_bearer_token` lines, so users can switch between GPT subscription mode and relay mode without manually editing `config.toml`.
+- Provides a headless `codex-tools` CLI for encrypted cloud session backup and restore. Production mode uses a Cloudflare Worker API in front of D1 and R2, so desktop/CLI clients never need R2 credentials.
 - Uses the Simplaj logo in the app header and links to `https://sub2api.simplaj.top/` for stable relay and technical support.
 - Backs up touched files under `~/.codex/backups_state/gpt-api-tools/<timestamp>`.
 
@@ -43,6 +88,142 @@ The sync flow mirrors `codex-provider-sync sync`: it does not switch ChatGPT log
 
 If old rollouts contain `encrypted_content` from another provider or account, this can restore list visibility, but continuing or compacting those exact histories can still fail upstream because encrypted content is account/provider-bound.
 
+## Cloud Session Backup
+
+The CLI can upload and restore Codex rollout files through a Cloudflare Worker API. It compresses and encrypts every rollout locally before upload, stores encrypted blobs in R2, and stores searchable metadata in D1.
+
+Production storage is split this way:
+
+- Worker API handles user/device registration, authentication, upload, list, and download.
+- D1 stores users, devices, latest session metadata, session versions, and audit events.
+- R2 stores encrypted session blobs only.
+- Clients store only the Worker URL, a device token, and the user's local sync passphrase.
+- No `auth.json`, API keys, `config.toml`, or ChatGPT tokens are uploaded.
+- The sync passphrase is required to decrypt restored sessions. If the passphrase is lost, uploaded blobs cannot be recovered.
+- R2 credentials must stay on Cloudflare/server-side infrastructure. Do not ship R2 credentials inside desktop builds or share them with end users.
+
+### User Setup
+
+Run `cloud login` once on each machine:
+
+```bash
+codex-tools cloud login --email user@example.com
+```
+
+The CLI registers the device with the default invite code `sub2api.simplaj.top`, asks for a sync passphrase, and saves local cloud configuration under `~/.codex/codex-api-tools-cloud.json`. On macOS/Linux the file is written with `0600` permissions. Keep the same sync passphrase on the same user's machines; it is needed to decrypt restored sessions.
+
+Commands:
+
+```bash
+# Verify the Worker API.
+codex-tools cloud smoke
+
+# Inspect local Codex sessions without uploading.
+codex-tools sessions list --limit 20
+codex-tools sessions list --json
+
+# Upload one session or all local session versions.
+codex-tools cloud push --session-id <session-id>
+codex-tools cloud push --all --limit 20
+
+# List latest cloud versions by session id.
+codex-tools cloud list
+codex-tools cloud list --json
+
+# Restore one session to this machine's CODEX_HOME.
+codex-tools cloud pull --session-id <session-id>
+```
+
+Check or remove the local login:
+
+```bash
+codex-tools cloud status
+codex-tools cloud logout
+```
+
+Environment variables are optional overrides for CI or temporary automation:
+
+- `CODEX_TOOLS_API_URL`
+- `CODEX_TOOLS_DEVICE_TOKEN`
+- `CODEX_TOOLS_SYNC_PASSPHRASE`
+- `CODEX_TOOLS_DEVICE_NAME`
+- `CODEX_TOOLS_INVITE_CODE`
+- `CODEX_TOOLS_ADMIN_BOOTSTRAP_TOKEN`
+
+`cloud register` is kept for debugging and admin automation, but normal users should use `cloud login`. A correct admin bootstrap token bypasses the invite code and registration rate limit for controlled automation.
+
+After restoring sessions on a machine that uses a different provider name, run the provider metadata sync so the histories are visible under the current provider:
+
+```bash
+codex-tools sessions list
+# Then use the desktop "sync only to new name" flow, or the existing native provider sync command in the app.
+```
+
+### Cloudflare Backend Setup
+
+The production backend lives under `cloudflare/sync-api`.
+
+1. Create the R2 bucket:
+
+```bash
+npx wrangler r2 bucket create codex-tools
+```
+
+2. Create the D1 database and copy the returned `database_id` into `cloudflare/sync-api/wrangler.jsonc`:
+
+```bash
+npx wrangler d1 create codex-tools-sync-prod
+```
+
+3. Apply the D1 schema:
+
+```bash
+cd cloudflare/sync-api
+npx wrangler d1 migrations apply codex-tools-sync-prod --remote
+```
+
+4. The Worker already has a registration rate limit binding in `wrangler.jsonc`:
+
+```jsonc
+"ratelimits": [
+  {
+    "name": "REGISTER_RATE_LIMITER",
+    "namespace_id": "5210608",
+    "simple": {
+      "limit": 10,
+      "period": 60
+    }
+  }
+]
+```
+
+5. The invite code defaults to `sub2api.simplaj.top` in `wrangler.jsonc`. Override it only if you need to rotate the public invite gate:
+
+```jsonc
+"vars": {
+  "REGISTRATION_INVITE_CODE": "sub2api.simplaj.top"
+}
+```
+
+6. Optional: set an admin bootstrap token for CI or support tooling. When the CLI sends this token, the Worker validates it and skips the invite/rate-limit checks:
+
+```bash
+ADMIN_BOOTSTRAP_TOKEN="$(openssl rand -hex 32)"
+printf "%s" "$ADMIN_BOOTSTRAP_TOKEN" | npx wrangler secret put ADMIN_BOOTSTRAP_TOKEN
+```
+
+7. Deploy the Worker:
+
+```bash
+npx wrangler deploy
+```
+
+Current configured backend resources:
+
+- Worker name: `codex-tools-sync-api`
+- R2 bucket: `codex-tools`
+- D1 database: `codex-tools-sync-prod`
+
 ## OpenAI Quota Check
 
 The quota query itself is read-only. It reads `~/.codex/auth.json`, extracts only the ChatGPT account id, email/plan claims, and access token needed for the request, then calls:
@@ -57,9 +238,13 @@ The switch controls are write operations and are protected by the same Codex pro
 
 ## Runtime Requirements
 
-End users do not need Node.js 24 for history sync. The upstream `codex-provider-sync` Node CLI requires Node.js 24+ because it uses the `node:sqlite` built-in module, but this app performs the sync inside the Tauri Rust backend with bundled SQLite through `rusqlite`.
+End users do not need Node.js, npm, or Rust. The release assets contain native desktop installers and standalone `codex-tools` CLI packages.
+
+The upstream `codex-provider-sync` Node CLI requires Node.js 24+ because it uses the `node:sqlite` built-in module, but this app performs the sync inside the Tauri Rust backend with bundled SQLite through `rusqlite`.
 
 ## Development
+
+Development still uses npm because the desktop UI is a Tauri + React app. This is only for contributors working from source.
 
 ```bash
 npm install
@@ -67,6 +252,18 @@ npm run dev
 ```
 
 On macOS external drives, AppleDouble `._*` sidecar files can break Tauri permission generation. The npm scripts run Tauri through `scripts/tauri-run.mjs`, which sets `CARGO_TARGET_DIR` to a system temp directory and `COPYFILE_DISABLE=1` to avoid that issue.
+
+Build the headless CLI:
+
+```bash
+npm run cli:build
+```
+
+Run the source-tree CLI during development:
+
+```bash
+npm run cli -- cloud status
+```
 
 ## Build Installers
 
@@ -81,7 +278,8 @@ GitHub Actions builds and publishes desktop releases with `.github/workflows/rel
 
 - Pushing to `main` creates a release tag like `codex-api-tools-v__VERSION__-<run_number>`.
 - Pushing a version tag such as `v0.1.1` publishes to that tag.
-- The matrix builds macOS Apple Silicon, macOS Intel, and Windows x64 installers.
+- The matrix builds macOS Apple Silicon, macOS Intel, and Windows x64 desktop installers.
+- The same release also publishes standalone CLI packages: `codex-tools-macos-aarch64.tar.gz`, `codex-tools-macos-x64.tar.gz`, `codex-tools-windows-x64.zip`, and `codex-tools-linux-x64.tar.gz`, plus SHA-256 checksum files.
 - macOS CI builds use ad-hoc signing. Windows artifacts are unsigned unless signing secrets are added later.
 
 The packaged app is written with Tauri + React and is intended to run on both macOS and Windows.

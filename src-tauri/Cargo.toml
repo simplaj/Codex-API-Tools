@@ -10,9 +10,15 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 base64 = "0.22"
+chacha20poly1305 = { version = "0.10", features = ["std"] }
 filetime = "0.2"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+hex = "0.4"
+rand = "0.8"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+rpassword = "7"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 tauri = { version = "2", features = [] }
+zstd = "0.13"

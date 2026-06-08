@@ -10,41 +10,36 @@ Download the latest assets from GitHub Releases:
 
 - macOS desktop: install the `.dmg`.
 - Windows desktop: run the `.exe` installer.
-- macOS CLI: download `codex-tools-macos-aarch64.tar.gz` for Apple Silicon, or `codex-tools-macos-x64.tar.gz` for Intel.
-- Windows CLI: download `codex-tools-windows-x64.zip`.
-- Linux CLI: download `codex-tools-linux-x64.tar.gz`.
 
-macOS CLI install:
+CLI install on macOS or Linux:
 
 ```bash
-tar -xzf codex-tools-macos-aarch64.tar.gz
-cd codex-tools-macos-aarch64
-./codex-tools cloud login --email user@example.com
+curl -fsSL https://github.com/simplaj/Codex-API-Tools/releases/latest/download/install-codex-tools.sh | bash
 ```
 
-Optional macOS global install:
-
-```bash
-mkdir -p ~/.local/bin
-cp codex-tools ~/.local/bin/codex-tools
-chmod +x ~/.local/bin/codex-tools
-```
-
-Windows CLI install:
+CLI install on Windows PowerShell:
 
 ```powershell
-Expand-Archive .\codex-tools-windows-x64.zip
-cd .\codex-tools-windows-x64
-.\codex-tools.exe cloud login --email user@example.com
+irm https://github.com/simplaj/Codex-API-Tools/releases/latest/download/install-codex-tools.ps1 | iex
 ```
 
-Linux CLI install:
+Then log in once on each machine:
 
 ```bash
-tar -xzf codex-tools-linux-x64.tar.gz
-cd codex-tools-linux-x64
-./codex-tools cloud login --email user@example.com
+codex-tools cloud login --email user@example.com
 ```
+
+Manual CLI downloads are still available if you need offline install or checksum verification. The raw binaries are the easiest manual path:
+
+- macOS CLI: `codex-tools-macos-aarch64` or `codex-tools-macos-x64`
+- Windows CLI: `codex-tools-windows-x64.exe`
+- Linux CLI: `codex-tools-linux-x64`
+
+Archive packages are also published:
+
+- macOS CLI: `codex-tools-macos-aarch64.tar.gz` or `codex-tools-macos-x64.tar.gz`
+- Windows CLI: `codex-tools-windows-x64.zip`
+- Linux CLI: `codex-tools-linux-x64.tar.gz`
 
 ## Features
 
@@ -279,7 +274,8 @@ GitHub Actions builds and publishes desktop releases with `.github/workflows/rel
 - Pushing to `main` creates a release tag like `codex-api-tools-v__VERSION__-<run_number>`.
 - Pushing a version tag such as `v0.1.1` publishes to that tag.
 - The matrix builds macOS Apple Silicon, macOS Intel, and Windows x64 desktop installers.
-- The same release also publishes standalone CLI packages: `codex-tools-macos-aarch64.tar.gz`, `codex-tools-macos-x64.tar.gz`, `codex-tools-windows-x64.zip`, and `codex-tools-linux-x64.tar.gz`, plus SHA-256 checksum files.
+- The same release publishes one-command CLI installers: `install-codex-tools.sh` and `install-codex-tools.ps1`.
+- It also publishes raw standalone CLI binaries (`codex-tools-macos-aarch64`, `codex-tools-macos-x64`, `codex-tools-windows-x64.exe`, `codex-tools-linux-x64`) and manual archive packages, plus SHA-256 checksum files.
 - macOS CI builds use ad-hoc signing. Windows artifacts are unsigned unless signing secrets are added later.
 
 The packaged app is written with Tauri + React and is intended to run on both macOS and Windows.

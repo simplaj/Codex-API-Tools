@@ -103,6 +103,9 @@ jobs:
           cp README.md "cli-package/${{ matrix.cli-package-name }}/README.md"
           tar -C cli-package -czf "release-cli/${{ matrix.cli-package-name }}.tar.gz" "${{ matrix.cli-package-name }}"
           shasum -a 256 "release-cli/${{ matrix.cli-package-name }}.tar.gz" > "release-cli/${{ matrix.cli-package-name }}.tar.gz.sha256.txt"
+          cp "${{ matrix.cli-binary-path }}" "release-cli/${{ matrix.cli-package-name }}"
+          chmod +x "release-cli/${{ matrix.cli-package-name }}"
+          shasum -a 256 "release-cli/${{ matrix.cli-package-name }}" > "release-cli/${{ matrix.cli-package-name }}.sha256.txt"
 
       - name: Package CLI artifact
         if: runner.os == 'Windows'
@@ -115,6 +118,9 @@ jobs:
           Compress-Archive -Path "cli-package/${{ matrix.cli-package-name }}" -DestinationPath "release-cli/${{ matrix.cli-package-name }}.zip" -Force
           $hash = (Get-FileHash -Algorithm SHA256 "release-cli/${{ matrix.cli-package-name }}.zip").Hash.ToLower()
           "$hash  ${{ matrix.cli-package-name }}.zip" | Out-File -Encoding ascii "release-cli/${{ matrix.cli-package-name }}.zip.sha256.txt"
+          Copy-Item "${{ matrix.cli-binary-path }}" "release-cli/${{ matrix.cli-package-name }}.exe"
+          $binaryHash = (Get-FileHash -Algorithm SHA256 "release-cli/${{ matrix.cli-package-name }}.exe").Hash.ToLower()
+          "$binaryHash  ${{ matrix.cli-package-name }}.exe" | Out-File -Encoding ascii "release-cli/${{ matrix.cli-package-name }}.exe.sha256.txt"
 
       - name: Upload desktop artifact
         uses: actions/upload-artifact@v4
@@ -170,6 +176,9 @@ jobs:
           cp README.md cli-package/codex-tools-linux-x64/README.md
           tar -C cli-package -czf release-cli/codex-tools-linux-x64.tar.gz codex-tools-linux-x64
           sha256sum release-cli/codex-tools-linux-x64.tar.gz > release-cli/codex-tools-linux-x64.tar.gz.sha256.txt
+          cp src-tauri/target/release/codex-tools release-cli/codex-tools-linux-x64
+          chmod +x release-cli/codex-tools-linux-x64
+          sha256sum release-cli/codex-tools-linux-x64 > release-cli/codex-tools-linux-x64.sha256.txt
 
       - name: Upload CLI artifact
         uses: actions/upload-artifact@v4
@@ -192,6 +201,14 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: release-assets
+
+      - name: Add CLI install scripts
+        shell: bash
+        run: |
+          mkdir -p release-assets/installers
+          cp scripts/install-codex-tools.sh release-assets/installers/install-codex-tools.sh
+          cp scripts/install-codex-tools.ps1 release-assets/installers/install-codex-tools.ps1
+          chmod +x release-assets/installers/install-codex-tools.sh
 
       - name: Resolve release metadata
         id: meta
@@ -220,7 +237,7 @@ jobs:
           fi
 
           title="Codex API Tools v${RELEASE_VERSION}"
-          notes=$'Download the Windows or macOS desktop installer from the assets below. Headless users can download the standalone codex-tools CLI tar.gz/zip for macOS, Windows, or Linux.\n\nEnd users do not need Node.js or npm. The app and CLI use the native Rust/rusqlite sync engine.'
+          notes=$'Download the Windows or macOS desktop installer from the assets below.\n\nCLI one-command install:\nmacOS/Linux: curl -fsSL https://github.com/simplaj/Codex-API-Tools/releases/latest/download/install-codex-tools.sh | bash\nWindows PowerShell: irm https://github.com/simplaj/Codex-API-Tools/releases/latest/download/install-codex-tools.ps1 | iex\n\nThe CLI installer downloads a single platform binary, verifies SHA-256, installs it into the user PATH, and does not require Node.js or npm. Manual tar.gz/zip packages are still provided for offline installs.'
 
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             gh release upload "${RELEASE_TAG}" "${files[@]}" --clobber

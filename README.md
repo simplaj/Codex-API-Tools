@@ -149,12 +149,14 @@ Environment variables are optional overrides for CI or temporary automation:
 - `CODEX_TOOLS_HTTP_TIMEOUT_SECS`
 - `CODEX_TOOLS_HTTP_CONNECT_TIMEOUT_SECS`
 - `CODEX_TOOLS_CHUNK_SIZE_BYTES`
+- `CODEX_TOOLS_CHUNK_UPLOAD_CONCURRENCY`
+- `CODEX_TOOLS_SESSION_UPLOAD_CONCURRENCY`
 
 `cloud register` is kept for debugging and admin automation, but normal users should use `cloud login`. A correct admin bootstrap token bypasses the invite code and registration rate limit for controlled automation.
 
 `cloud push` is idempotent by default. Before uploading, the CLI checks the latest cloud version for the same session and skips it when the remote `raw_sha256` already matches the local file. The Worker also skips an already stored `session_id + raw_sha256` before reading the upload body, so a retry after a lost response will not re-upload the same blob. Use `--force` only when you intentionally want to bypass the duplicate preflight and rewrite an existing version.
 
-Large encrypted rollouts are uploaded in chunks automatically. Files up to 50 MB encrypted size use a single request; larger encrypted payloads default to 16 MB chunks and are finalized by a chunk manifest in R2. Override the chunk size with `CODEX_TOOLS_CHUNK_SIZE_BYTES` only for debugging or constrained networks.
+Large encrypted rollouts are uploaded in chunks automatically. Files up to 50 MB encrypted size use a single request; larger encrypted payloads default to 16 MB chunks and are finalized by a chunk manifest in R2. `cloud push --all` processes 2 session groups in parallel by default, and each large session uploads up to 4 chunks in parallel. A session group is one `session_id`; if the same session has multiple local versions, those versions are still uploaded serially from old to new so the latest cloud version stays correct. Tune `CODEX_TOOLS_SESSION_UPLOAD_CONCURRENCY` down when memory is tight or up to 8 for faster machines; tune `CODEX_TOOLS_CHUNK_UPLOAD_CONCURRENCY` down for unstable networks or up to 16 for faster links. Override `CODEX_TOOLS_CHUNK_SIZE_BYTES` only for debugging or constrained networks.
 
 If Codex is still writing an active rollout file, the same session id can produce a new `raw_sha256` on every run. That is treated as a new session version, not a duplicate. Close or pause Codex before a final backup if you want a stable snapshot.
 

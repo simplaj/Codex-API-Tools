@@ -11,6 +11,7 @@ use std::env;
 use std::fs;
 use std::io::{self, BufRead, ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -24,8 +25,13 @@ const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 180;
 const DEFAULT_HTTP_CONNECT_TIMEOUT_SECS: u64 = 20;
 const MAX_SINGLE_UPLOAD_BYTES: usize = 50 * 1024 * 1024;
 const DEFAULT_CHUNK_SIZE_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_CHUNK_UPLOAD_CONCURRENCY: usize = 4;
+const MAX_CHUNK_UPLOAD_CONCURRENCY: usize = 16;
+const DEFAULT_SESSION_UPLOAD_CONCURRENCY: usize = 2;
+const MAX_SESSION_UPLOAD_CONCURRENCY: usize = 8;
 const MAX_DECOMPRESSED_SESSION_BYTES: usize = 512 * 1024 * 1024;
 
+#[derive(Clone)]
 struct ApiClient {
     api_url: String,
     device_token: Option<String>,
@@ -149,6 +155,12 @@ struct ChunkDescriptor {
 #[serde(rename_all = "camelCase")]
 struct ChunkCompleteRequest {
     chunks: Vec<ChunkDescriptor>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PushSessionOutcome {
+    Uploaded,
+    Skipped,
 }
 
 fn main() {
@@ -400,90 +412,208 @@ fn cloud_push_api(args: &[String], api: &ApiClient) -> Result<(), String> {
         return Err("no local sessions matched the push filter".into());
     }
 
+    let session_groups = group_local_sessions_by_id(sessions);
+    let session_concurrency = optional_env("CODEX_TOOLS_SESSION_UPLOAD_CONCURRENCY")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(MAX_SESSION_UPLOAD_CONCURRENCY))
+        .unwrap_or(DEFAULT_SESSION_UPLOAD_CONCURRENCY)
+        .min(session_groups.len());
+    println!(
+        "session upload concurrency: {} parallel session group(s)",
+        session_concurrency
+    );
     let mut uploaded = 0usize;
     let mut skipped = 0usize;
-    let mut local_seen = HashSet::new();
-    for session in sessions {
-        let raw_path = codex_home.join(&session.relative_path);
-        println!(
-            "checking {}  {} bytes  {}",
-            session.session_id, session.size, session.relative_path
-        );
-        let raw = fs::read(&raw_path).map_err(to_error)?;
-        let raw_sha256 = sha256_hex(&raw);
-
-        let version_key = format!("{}\0{}", session.session_id, raw_sha256);
-        if !local_seen.insert(version_key) {
-            skipped += 1;
-            println!(
-                "skipped {}: duplicate local version {}",
-                session.session_id, raw_sha256
-            );
-            continue;
+    let local_seen = Arc::new(Mutex::new(HashSet::new()));
+    let mut session_iter = session_groups.into_iter();
+    loop {
+        let batch: Vec<_> = session_iter.by_ref().take(session_concurrency).collect();
+        if batch.is_empty() {
+            break;
         }
-
-        if !force {
-            match api.latest_version_optional(&session.session_id) {
-                Ok(Some(remote)) if remote.raw_sha256 == raw_sha256 => {
-                    skipped += 1;
-                    println!(
-                        "skipped {}: already uploaded {}",
-                        session.session_id, raw_sha256
-                    );
-                    continue;
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    return Err(format!(
-                        "cannot verify remote state for {} before upload: {}\nRe-run with --force to upload without the preflight duplicate check.",
-                        session.session_id, error
-                    ));
-                }
+        let batch_results = thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(batch.len());
+            for sessions in batch {
+                let api = api.clone();
+                let passphrase = passphrase.to_string();
+                let codex_home = codex_home.clone();
+                let device_name = device_name.clone();
+                let local_seen = Arc::clone(&local_seen);
+                handles.push(scope.spawn(move || {
+                    push_local_session_group(
+                        api,
+                        passphrase,
+                        codex_home,
+                        device_name,
+                        sessions,
+                        force,
+                        local_seen,
+                    )
+                }));
             }
+            let mut results = Vec::with_capacity(handles.len());
+            for handle in handles {
+                results.push(
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err("session upload worker panicked".into())),
+                );
+            }
+            results
+        });
+        for result in batch_results {
+            let (batch_uploaded, batch_skipped) = result?;
+            uploaded += batch_uploaded;
+            skipped += batch_skipped;
         }
-
-        let encrypted = encrypt_payload(&raw, &passphrase)?;
-        let encrypted_sha256 = sha256_hex(&encrypted);
-        println!(
-            "uploading {}: raw {}, encrypted {} bytes",
-            session.session_id,
-            raw_sha256,
-            encrypted.len()
-        );
-        let manifest = SessionManifest {
-            format: ENVELOPE_FORMAT.into(),
-            session_id: session.session_id.clone(),
-            relative_path: session.relative_path.clone(),
-            source_dir: session.source_dir.clone(),
-            title: session.title.clone(),
-            cwd: session.cwd.clone(),
-            provider_name: session.provider_name.clone(),
-            model: session.model.clone(),
-            raw_sha256: raw_sha256.clone(),
-            encrypted_sha256,
-            encrypted_size: encrypted.len(),
-            blob_key: String::new(),
-            uploaded_at_ms: unix_millis(),
-            device_name: device_name.clone(),
-        };
-        let result = api.put_version(&manifest, encrypted, force)?;
-        if !result.ok {
-            return Err(api_error("push", result.error, result.message));
-        }
-        if result.skipped.unwrap_or(false) {
-            skipped += 1;
-            println!(
-                "skipped {}: already existed on API {}",
-                session.session_id, raw_sha256
-            );
-            continue;
-        }
-        uploaded += 1;
-        println!("uploaded {} -> API {}", session.session_id, raw_sha256);
     }
 
     println!("cloud push ok: uploaded {uploaded}, skipped {skipped}");
     Ok(())
+}
+
+fn group_local_sessions_by_id(sessions: Vec<LocalSessionMeta>) -> Vec<Vec<LocalSessionMeta>> {
+    let mut groups: Vec<Vec<LocalSessionMeta>> = Vec::new();
+    let mut group_indexes: HashMap<String, usize> = HashMap::new();
+    for session in sessions {
+        if let Some(index) = group_indexes.get(&session.session_id).copied() {
+            groups[index].push(session);
+            continue;
+        }
+        group_indexes.insert(session.session_id.clone(), groups.len());
+        groups.push(vec![session]);
+    }
+    for group in &mut groups {
+        group.sort_by(|left, right| {
+            left.modified_at_ms
+                .cmp(&right.modified_at_ms)
+                .then_with(|| left.relative_path.cmp(&right.relative_path))
+        });
+    }
+    groups
+}
+
+fn push_local_session_group(
+    api: ApiClient,
+    passphrase: String,
+    codex_home: PathBuf,
+    device_name: String,
+    sessions: Vec<LocalSessionMeta>,
+    force: bool,
+    local_seen: Arc<Mutex<HashSet<String>>>,
+) -> Result<(usize, usize), String> {
+    let mut uploaded = 0usize;
+    let mut skipped = 0usize;
+    let mut last_uploaded_at_ms = 0u128;
+    for session in sessions {
+        let uploaded_at_ms = unix_millis().max(last_uploaded_at_ms.saturating_add(1));
+        last_uploaded_at_ms = uploaded_at_ms;
+        match push_local_session(
+            api.clone(),
+            passphrase.clone(),
+            codex_home.clone(),
+            device_name.clone(),
+            session,
+            force,
+            Arc::clone(&local_seen),
+            uploaded_at_ms,
+        )? {
+            PushSessionOutcome::Uploaded => uploaded += 1,
+            PushSessionOutcome::Skipped => skipped += 1,
+        }
+    }
+    Ok((uploaded, skipped))
+}
+
+fn push_local_session(
+    api: ApiClient,
+    passphrase: String,
+    codex_home: PathBuf,
+    device_name: String,
+    session: LocalSessionMeta,
+    force: bool,
+    local_seen: Arc<Mutex<HashSet<String>>>,
+    uploaded_at_ms: u128,
+) -> Result<PushSessionOutcome, String> {
+    let raw_path = codex_home.join(&session.relative_path);
+    println!(
+        "checking {}  {} bytes  {}",
+        session.session_id, session.size, session.relative_path
+    );
+    let raw = fs::read(&raw_path).map_err(to_error)?;
+    let raw_sha256 = sha256_hex(&raw);
+
+    let version_key = format!("{}\0{}", session.session_id, raw_sha256);
+    {
+        let mut seen = local_seen
+            .lock()
+            .map_err(|_| "local version lock poisoned".to_string())?;
+        if !seen.insert(version_key) {
+            println!(
+                "skipped {}: duplicate local version {}",
+                session.session_id, raw_sha256
+            );
+            return Ok(PushSessionOutcome::Skipped);
+        }
+    }
+
+    if !force {
+        match api.latest_version_optional(&session.session_id) {
+            Ok(Some(remote)) if remote.raw_sha256 == raw_sha256 => {
+                println!(
+                    "skipped {}: already uploaded {}",
+                    session.session_id, raw_sha256
+                );
+                return Ok(PushSessionOutcome::Skipped);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot verify remote state for {} before upload: {}\nRe-run with --force to upload without the preflight duplicate check.",
+                    session.session_id, error
+                ));
+            }
+        }
+    }
+
+    let encrypted = encrypt_payload(&raw, &passphrase)?;
+    let encrypted_sha256 = sha256_hex(&encrypted);
+    println!(
+        "uploading {}: raw {}, encrypted {} bytes",
+        session.session_id,
+        raw_sha256,
+        encrypted.len()
+    );
+    let manifest = SessionManifest {
+        format: ENVELOPE_FORMAT.into(),
+        session_id: session.session_id.clone(),
+        relative_path: session.relative_path.clone(),
+        source_dir: session.source_dir.clone(),
+        title: session.title.clone(),
+        cwd: session.cwd.clone(),
+        provider_name: session.provider_name.clone(),
+        model: session.model.clone(),
+        raw_sha256: raw_sha256.clone(),
+        encrypted_sha256,
+        encrypted_size: encrypted.len(),
+        blob_key: String::new(),
+        uploaded_at_ms,
+        device_name,
+    };
+    let result = api.put_version(&manifest, encrypted, force)?;
+    if !result.ok {
+        return Err(api_error("push", result.error, result.message));
+    }
+    if result.skipped.unwrap_or(false) {
+        println!(
+            "skipped {}: already existed on API {}",
+            session.session_id, raw_sha256
+        );
+        return Ok(PushSessionOutcome::Skipped);
+    }
+    println!("uploaded {} -> API {}", session.session_id, raw_sha256);
+    Ok(PushSessionOutcome::Uploaded)
 }
 
 fn cloud_list_api(args: &[String], api: &ApiClient) -> Result<(), String> {
@@ -886,29 +1016,64 @@ impl ApiClient {
             .filter(|value| *value > 0 && *value <= MAX_SINGLE_UPLOAD_BYTES)
             .unwrap_or(DEFAULT_CHUNK_SIZE_BYTES);
         let chunk_count = encrypted.len().div_ceil(chunk_size);
+        let concurrency = optional_env("CODEX_TOOLS_CHUNK_UPLOAD_CONCURRENCY")
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .map(|value| value.min(MAX_CHUNK_UPLOAD_CONCURRENCY))
+            .unwrap_or(DEFAULT_CHUNK_UPLOAD_CONCURRENCY)
+            .min(chunk_count);
         println!(
-            "chunked upload {}: {} bytes in {} chunk(s) of up to {} bytes",
+            "chunked upload {}: {} bytes in {} chunk(s) of up to {} bytes, {} parallel upload(s)",
             manifest.session_id,
             encrypted.len(),
             chunk_count,
-            chunk_size
+            chunk_size,
+            concurrency
         );
         let mut chunks = Vec::with_capacity(chunk_count);
-        for (index, chunk) in encrypted.chunks(chunk_size).enumerate() {
-            let sha256 = sha256_hex(chunk);
-            self.put_chunk(manifest, index, chunk, &sha256)?;
-            println!(
-                "uploaded chunk {}/{} for {}",
-                index + 1,
-                chunk_count,
-                manifest.session_id
-            );
-            chunks.push(ChunkDescriptor {
-                index,
-                size: chunk.len(),
-                sha256,
+        let mut chunk_iter = encrypted.chunks(chunk_size).enumerate();
+        loop {
+            let batch: Vec<_> = chunk_iter.by_ref().take(concurrency).collect();
+            if batch.is_empty() {
+                break;
+            }
+            let batch_results = thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(batch.len());
+                for (index, chunk) in batch {
+                    let client = self.clone();
+                    let manifest = manifest.clone();
+                    handles.push(scope.spawn(move || {
+                        let sha256 = sha256_hex(chunk);
+                        client.put_chunk(&manifest, index, chunk, &sha256)?;
+                        Ok::<ChunkDescriptor, String>(ChunkDescriptor {
+                            index,
+                            size: chunk.len(),
+                            sha256,
+                        })
+                    }));
+                }
+                let mut results = Vec::with_capacity(handles.len());
+                for handle in handles {
+                    results.push(
+                        handle
+                            .join()
+                            .unwrap_or_else(|_| Err("chunk upload worker panicked".into())),
+                    );
+                }
+                results
             });
+            for result in batch_results {
+                let descriptor = result?;
+                println!(
+                    "uploaded chunk {}/{} for {}",
+                    descriptor.index + 1,
+                    chunk_count,
+                    manifest.session_id
+                );
+                chunks.push(descriptor);
+            }
         }
+        chunks.sort_by_key(|chunk| chunk.index);
         self.complete_chunked_version(manifest, chunks, force)
     }
 
@@ -1355,6 +1520,8 @@ Usage:
 Run `codex-tools cloud login` once to save local cloud configuration.
 Environment variables CODEX_TOOLS_API_URL, CODEX_TOOLS_DEVICE_TOKEN, and
 CODEX_TOOLS_SYNC_PASSPHRASE are optional overrides for automation.
+Tune upload parallelism with CODEX_TOOLS_SESSION_UPLOAD_CONCURRENCY and
+CODEX_TOOLS_CHUNK_UPLOAD_CONCURRENCY.
 New device registration sends invite code sub2api.simplaj.top by default.
 Cloud push skips already uploaded versions by default; use --force to re-upload.
 "#
@@ -1401,5 +1568,39 @@ mod tests {
         let latest = latest_manifests(vec![older, newer]);
         assert_eq!(latest.len(), 1);
         assert_eq!(latest[0].raw_sha256, "new");
+    }
+
+    #[test]
+    fn session_groups_keep_same_session_versions_old_to_new() {
+        let newest_s1 = test_local_session("s1", "sessions/new.jsonl", 30);
+        let s2 = test_local_session("s2", "sessions/other.jsonl", 20);
+        let oldest_s1 = test_local_session("s1", "sessions/old.jsonl", 10);
+
+        let groups = group_local_sessions_by_id(vec![newest_s1, s2, oldest_s1]);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[0][0].relative_path, "sessions/old.jsonl");
+        assert_eq!(groups[0][1].relative_path, "sessions/new.jsonl");
+        assert_eq!(groups[1].len(), 1);
+        assert_eq!(groups[1][0].session_id, "s2");
+    }
+
+    fn test_local_session(
+        session_id: &str,
+        relative_path: &str,
+        modified_at_ms: u128,
+    ) -> LocalSessionMeta {
+        LocalSessionMeta {
+            session_id: session_id.into(),
+            relative_path: relative_path.into(),
+            source_dir: "sessions".into(),
+            title: None,
+            cwd: None,
+            provider_name: None,
+            model: None,
+            modified_at_ms,
+            size: 1,
+        }
     }
 }

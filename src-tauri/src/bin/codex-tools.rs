@@ -22,6 +22,8 @@ const DEFAULT_INVITE_CODE: &str = "sub2api.simplaj.top";
 const DEFAULT_HTTP_RETRIES: usize = 4;
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 180;
 const DEFAULT_HTTP_CONNECT_TIMEOUT_SECS: u64 = 20;
+const MAX_SINGLE_UPLOAD_BYTES: usize = 50 * 1024 * 1024;
+const DEFAULT_CHUNK_SIZE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DECOMPRESSED_SESSION_BYTES: usize = 512 * 1024 * 1024;
 
 struct ApiClient {
@@ -133,6 +135,20 @@ struct ApiManifestResponse {
     message: Option<String>,
     manifest: Option<SessionManifest>,
     skipped: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChunkDescriptor {
+    index: usize,
+    size: usize,
+    sha256: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChunkCompleteRequest {
+    chunks: Vec<ChunkDescriptor>,
 }
 
 fn main() {
@@ -836,6 +852,9 @@ impl ApiClient {
         encrypted: Vec<u8>,
         force: bool,
     ) -> Result<ApiManifestResponse, String> {
+        if encrypted.len() > MAX_SINGLE_UPLOAD_BYTES {
+            return self.put_chunked_version(manifest, encrypted, force);
+        }
         let manifest_header = STANDARD.encode(serde_json::to_vec(manifest).map_err(to_error)?);
         let path = format!(
             "/v1/sessions/{}/versions/{}",
@@ -854,6 +873,103 @@ impl ApiClient {
                 .body(encrypted.clone())
         })?;
         read_json_response(response, "put version")
+    }
+
+    fn put_chunked_version(
+        &self,
+        manifest: &SessionManifest,
+        encrypted: Vec<u8>,
+        force: bool,
+    ) -> Result<ApiManifestResponse, String> {
+        let chunk_size = optional_env("CODEX_TOOLS_CHUNK_SIZE_BYTES")
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0 && *value <= MAX_SINGLE_UPLOAD_BYTES)
+            .unwrap_or(DEFAULT_CHUNK_SIZE_BYTES);
+        let chunk_count = encrypted.len().div_ceil(chunk_size);
+        println!(
+            "chunked upload {}: {} bytes in {} chunk(s) of up to {} bytes",
+            manifest.session_id,
+            encrypted.len(),
+            chunk_count,
+            chunk_size
+        );
+        let mut chunks = Vec::with_capacity(chunk_count);
+        for (index, chunk) in encrypted.chunks(chunk_size).enumerate() {
+            let sha256 = sha256_hex(chunk);
+            self.put_chunk(manifest, index, chunk, &sha256)?;
+            println!(
+                "uploaded chunk {}/{} for {}",
+                index + 1,
+                chunk_count,
+                manifest.session_id
+            );
+            chunks.push(ChunkDescriptor {
+                index,
+                size: chunk.len(),
+                sha256,
+            });
+        }
+        self.complete_chunked_version(manifest, chunks, force)
+    }
+
+    fn put_chunk(
+        &self,
+        manifest: &SessionManifest,
+        index: usize,
+        chunk: &[u8],
+        sha256: &str,
+    ) -> Result<ApiStatusResponse, String> {
+        let manifest_header = STANDARD.encode(serde_json::to_vec(manifest).map_err(to_error)?);
+        let path = format!(
+            "/v1/sessions/{}/versions/{}/chunks/{}",
+            percent_encode_path(&manifest.session_id),
+            manifest.raw_sha256,
+            index
+        );
+        let token = self.required_device_token()?.to_string();
+        let body = chunk.to_vec();
+        let response = self.send_with_retries("put chunk", || {
+            self.client
+                .put(self.url(&path))
+                .header("user-agent", USER_AGENT_VALUE)
+                .header("content-type", "application/octet-stream")
+                .header("x-codex-tools-manifest", manifest_header.as_str())
+                .header("x-codex-tools-chunk-sha256", sha256)
+                .header("x-codex-tools-chunk-size", chunk.len().to_string())
+                .bearer_auth(token.as_str())
+                .body(body.clone())
+        })?;
+        let result: ApiStatusResponse = read_json_response(response, "put chunk")?;
+        if !result.ok {
+            return Err(api_error("put chunk", result.error, result.message));
+        }
+        Ok(result)
+    }
+
+    fn complete_chunked_version(
+        &self,
+        manifest: &SessionManifest,
+        chunks: Vec<ChunkDescriptor>,
+        force: bool,
+    ) -> Result<ApiManifestResponse, String> {
+        let manifest_header = STANDARD.encode(serde_json::to_vec(manifest).map_err(to_error)?);
+        let path = format!(
+            "/v1/sessions/{}/versions/{}/chunks/complete",
+            percent_encode_path(&manifest.session_id),
+            manifest.raw_sha256
+        );
+        let token = self.required_device_token()?.to_string();
+        let payload = ChunkCompleteRequest { chunks };
+        let response = self.send_with_retries("complete chunked version", || {
+            self.client
+                .post(self.url(&path))
+                .header("user-agent", USER_AGENT_VALUE)
+                .header("x-codex-tools-manifest", manifest_header.as_str())
+                .header("x-codex-tools-force", if force { "true" } else { "false" })
+                .bearer_auth(token.as_str())
+                .json(&payload)
+        })?;
+        read_json_response(response, "complete chunked version")
     }
 
     fn latest_version(&self, session_id: &str) -> Result<ApiManifestResponse, String> {

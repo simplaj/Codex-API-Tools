@@ -40,8 +40,38 @@ type SessionManifest = {
   deviceName: string;
 };
 
+type ChunkDescriptor = {
+  index: number;
+  size: number;
+  sha256: string;
+  key: string;
+};
+
+type ChunkCompleteDescriptor = {
+  index?: number;
+  size?: number;
+  sha256?: string;
+};
+
+type ChunkCompleteBody = {
+  chunks?: ChunkCompleteDescriptor[];
+};
+
+type ChunkedBlobManifest = {
+  format: string;
+  sessionId: string;
+  rawSha256: string;
+  encryptedSha256: string;
+  encryptedSize: number;
+  chunks: ChunkDescriptor[];
+};
+
 const ENVELOPE_FORMAT = "codex-tools-session-v1";
+const CHUNK_MANIFEST_FORMAT = "codex-tools-chunk-manifest-v1";
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+const MAX_CHUNKED_UPLOAD_BYTES = 1024 * 1024 * 1024;
+const MAX_CHUNK_COUNT = 256;
+const CHUNK_MANIFEST_SUFFIX = ".chunks.json";
 const DEFAULT_INVITE_CODE = "sub2api.simplaj.top";
 
 export default {
@@ -71,6 +101,30 @@ export default {
       const putMatch = path.match(/^\/v1\/sessions\/([^/]+)\/versions\/([a-f0-9]{64})$/);
       if (request.method === "PUT" && putMatch) {
         return handlePutVersion(request, env, auth, decodeSessionId(putMatch[1]), putMatch[2]);
+      }
+
+      const chunkMatch = path.match(/^\/v1\/sessions\/([^/]+)\/versions\/([a-f0-9]{64})\/chunks\/(\d+)$/);
+      if (chunkMatch) {
+        const sessionId = decodeSessionId(chunkMatch[1]);
+        const rawSha256 = chunkMatch[2];
+        const chunkIndex = Number(chunkMatch[3]);
+        if (request.method === "PUT") {
+          return handlePutChunk(request, env, auth, sessionId, rawSha256, chunkIndex);
+        }
+        if (request.method === "GET") {
+          return handleGetChunk(env, auth, sessionId, rawSha256, chunkIndex);
+        }
+      }
+
+      const completeMatch = path.match(/^\/v1\/sessions\/([^/]+)\/versions\/([a-f0-9]{64})\/chunks\/complete$/);
+      if (request.method === "POST" && completeMatch) {
+        return handleCompleteChunkedVersion(
+          request,
+          env,
+          auth,
+          decodeSessionId(completeMatch[1]),
+          completeMatch[2]
+        );
       }
 
       const latestMatch = path.match(/^\/v1\/sessions\/([^/]+)\/versions\/latest$/);
@@ -236,15 +290,7 @@ async function handlePutVersion(
     return json({ ok: false, error: "encrypted_sha256_mismatch" }, 400);
   }
 
-  const now = Date.now();
-  const sessionRowId = `ses_${auth.userId}_${sessionId}`.replace(/[^A-Za-z0-9_:-]/g, "_");
-  const sourceDir = manifest.sourceDir === "archived_sessions" ? "archived_sessions" : "sessions";
   const blobKey = `${objectPrefix(env)}/${auth.userId}/sessions/${sessionId}/versions/${rawSha256}.jsonl.zst.enc`;
-  const title = cleanText(manifest.title, 500);
-  const cwd = cleanText(manifest.cwd, 2000);
-  const providerName = cleanText(manifest.providerName, 200);
-  const model = cleanText(manifest.model, 200);
-  const relativePath = cleanText(manifest.relativePath, 4000) || `${sourceDir}/${sessionId}.jsonl`;
 
   await env.SESSION_BUCKET.put(blobKey, encrypted, {
     httpMetadata: { contentType: "application/octet-stream" },
@@ -255,6 +301,39 @@ async function handlePutVersion(
       encryptedSha256
     }
   });
+
+  await saveVersionMetadata(env, auth, sessionId, rawSha256, manifest, blobKey, encryptedSha256, encrypted.byteLength);
+  await audit(env, auth.userId, auth.deviceId, "session.upload", sessionId);
+
+  return json({
+    ok: true,
+    manifest: {
+      ...manifest,
+      blobKey,
+      encryptedSha256,
+      encryptedSize: encrypted.byteLength
+    }
+  });
+}
+
+async function saveVersionMetadata(
+  env: Env,
+  auth: AuthContext,
+  sessionId: string,
+  rawSha256: string,
+  manifest: SessionManifest,
+  blobKey: string,
+  encryptedSha256: string,
+  encryptedSize: number
+): Promise<void> {
+  const now = Date.now();
+  const sessionRowId = `ses_${auth.userId}_${sessionId}`.replace(/[^A-Za-z0-9_:-]/g, "_");
+  const sourceDir = manifest.sourceDir === "archived_sessions" ? "archived_sessions" : "sessions";
+  const title = cleanText(manifest.title, 500);
+  const cwd = cleanText(manifest.cwd, 2000);
+  const providerName = cleanText(manifest.providerName, 200);
+  const model = cleanText(manifest.model, 200);
+  const relativePath = cleanText(manifest.relativePath, 4000) || `${sourceDir}/${sessionId}.jsonl`;
 
   await env.DB.prepare(
     `INSERT INTO sessions (
@@ -308,7 +387,7 @@ async function handlePutVersion(
     auth.deviceId,
     rawSha256,
     encryptedSha256,
-    encrypted.byteLength,
+    encryptedSize,
     blobKey,
     relativePath,
     sourceDir,
@@ -319,15 +398,155 @@ async function handlePutVersion(
     manifest.uploadedAtMs || now,
     now
   ).run();
-  await audit(env, auth.userId, auth.deviceId, "session.upload", sessionId);
+}
 
+async function handlePutChunk(
+  request: Request,
+  env: Env,
+  auth: AuthContext,
+  sessionId: string,
+  rawSha256: string,
+  chunkIndex: number
+): Promise<Response> {
+  validateSessionId(sessionId);
+  validateChunkIndex(chunkIndex);
+  const manifest = parseManifestHeader(request.headers.get("x-codex-tools-manifest"));
+  validateManifest(manifest, sessionId, rawSha256);
+  validateChunkedManifest(manifest);
+
+  const expectedSha256 = request.headers.get("x-codex-tools-chunk-sha256") || "";
+  const expectedSize = Number(request.headers.get("x-codex-tools-chunk-size") || 0);
+  if (!/^[a-f0-9]{64}$/.test(expectedSha256)) {
+    return json({ ok: false, error: "invalid_chunk_sha256" }, 400);
+  }
+
+  const chunk = await request.arrayBuffer();
+  if (chunk.byteLength <= 0) {
+    return json({ ok: false, error: "empty_chunk" }, 400);
+  }
+  if (chunk.byteLength > MAX_UPLOAD_BYTES) {
+    return json({ ok: false, error: "chunk_too_large", maxBytes: MAX_UPLOAD_BYTES }, 413);
+  }
+  if (!Number.isSafeInteger(expectedSize) || expectedSize !== chunk.byteLength) {
+    return json({ ok: false, error: "chunk_size_mismatch" }, 400);
+  }
+  const chunkSha256 = await sha256Hex(chunk);
+  if (chunkSha256 !== expectedSha256) {
+    return json({ ok: false, error: "chunk_sha256_mismatch" }, 400);
+  }
+
+  const key = chunkKey(env, auth.userId, sessionId, rawSha256, chunkIndex);
+  await env.SESSION_BUCKET.put(key, chunk, {
+    httpMetadata: { contentType: "application/octet-stream" },
+    customMetadata: {
+      userId: auth.userId,
+      sessionId,
+      rawSha256,
+      chunkIndex: String(chunkIndex),
+      chunkSha256
+    }
+  });
+  await audit(env, auth.userId, auth.deviceId, "session.upload.chunk", `${sessionId}:${chunkIndex}`);
   return json({
     ok: true,
+    chunk: {
+      index: chunkIndex,
+      size: chunk.byteLength,
+      sha256: chunkSha256
+    }
+  });
+}
+
+async function handleCompleteChunkedVersion(
+  request: Request,
+  env: Env,
+  auth: AuthContext,
+  sessionId: string,
+  rawSha256: string
+): Promise<Response> {
+  const manifest = parseManifestHeader(request.headers.get("x-codex-tools-manifest"));
+  validateManifest(manifest, sessionId, rawSha256);
+  validateChunkedManifest(manifest);
+
+  if (!forceUpload(request)) {
+    const existing = await env.DB.prepare(
+      `SELECT * FROM session_versions
+       WHERE user_id = ?1 AND session_id = ?2 AND raw_sha256 = ?3
+       LIMIT 1`
+    ).bind(auth.userId, sessionId, rawSha256).first<Record<string, unknown>>();
+    if (existing) {
+      await audit(env, auth.userId, auth.deviceId, "session.upload.skip_existing", sessionId);
+      return json({
+        ok: true,
+        skipped: true,
+        manifest: rowToManifest(existing)
+      });
+    }
+  }
+
+  const body = await request.json().catch(() => null) as ChunkCompleteBody | null;
+  const requestedChunks = body?.chunks || [];
+  if (!Array.isArray(requestedChunks) || requestedChunks.length <= 0) {
+    return json({ ok: false, error: "chunks_required" }, 400);
+  }
+  if (requestedChunks.length > MAX_CHUNK_COUNT) {
+    return json({ ok: false, error: "too_many_chunks", maxChunks: MAX_CHUNK_COUNT }, 400);
+  }
+
+  const chunks: ChunkDescriptor[] = [];
+  let totalSize = 0;
+  for (let expectedIndex = 0; expectedIndex < requestedChunks.length; expectedIndex += 1) {
+    const chunk = requestedChunks[expectedIndex];
+    const index = Number(chunk.index);
+    const size = Number(chunk.size);
+    const sha256 = String(chunk.sha256 || "");
+    if (index !== expectedIndex || !Number.isSafeInteger(size) || size <= 0 || !/^[a-f0-9]{64}$/.test(sha256)) {
+      return json({ ok: false, error: "invalid_chunk_descriptor", index: expectedIndex }, 400);
+    }
+    const key = chunkKey(env, auth.userId, sessionId, rawSha256, index);
+    const object = await env.SESSION_BUCKET.head(key);
+    if (!object) {
+      return json({ ok: false, error: "missing_chunk", index }, 400);
+    }
+    if (object.size !== size || object.customMetadata?.chunkSha256 !== sha256) {
+      return json({ ok: false, error: "chunk_metadata_mismatch", index }, 400);
+    }
+    totalSize += size;
+    chunks.push({ index, size, sha256, key });
+  }
+  if (totalSize !== manifest.encryptedSize) {
+    return json({ ok: false, error: "encrypted_size_mismatch" }, 400);
+  }
+
+  const blobKey = chunkManifestKey(env, auth.userId, sessionId, rawSha256);
+  const chunkManifest: ChunkedBlobManifest = {
+    format: CHUNK_MANIFEST_FORMAT,
+    sessionId,
+    rawSha256,
+    encryptedSha256: manifest.encryptedSha256,
+    encryptedSize: manifest.encryptedSize,
+    chunks
+  };
+  await env.SESSION_BUCKET.put(blobKey, JSON.stringify(chunkManifest), {
+    httpMetadata: { contentType: "application/json" },
+    customMetadata: {
+      userId: auth.userId,
+      sessionId,
+      rawSha256,
+      encryptedSha256: manifest.encryptedSha256,
+      chunkCount: String(chunks.length)
+    }
+  });
+
+  await saveVersionMetadata(env, auth, sessionId, rawSha256, manifest, blobKey, manifest.encryptedSha256, manifest.encryptedSize);
+  await audit(env, auth.userId, auth.deviceId, "session.upload.chunked", sessionId);
+  return json({
+    ok: true,
+    chunked: true,
     manifest: {
       ...manifest,
       blobKey,
-      encryptedSha256,
-      encryptedSize: encrypted.byteLength
+      encryptedSize: manifest.encryptedSize
     }
   });
 }
@@ -368,11 +587,52 @@ async function handleGetBlob(
     return json({ ok: false, error: "blob_not_found" }, 404);
   }
   await audit(env, auth.userId, auth.deviceId, "session.download", sessionId);
+  if (blobKey.endsWith(CHUNK_MANIFEST_SUFFIX)) {
+    const chunkManifest = JSON.parse(await object.text()) as ChunkedBlobManifest;
+    validateStoredChunkManifest(chunkManifest, sessionId, rawSha256);
+    const stream = streamChunks(env, chunkManifest);
+    return withCors(new Response(stream, {
+      headers: {
+        "content-type": "application/octet-stream",
+        "x-codex-tools-manifest": btoa(JSON.stringify(rowToManifest(row)))
+      }
+    }));
+  }
   return withCors(new Response(object.body, {
     headers: {
       "content-type": "application/octet-stream",
       "x-codex-tools-manifest": btoa(JSON.stringify(rowToManifest(row)))
     }
+  }));
+}
+
+async function handleGetChunk(
+  env: Env,
+  auth: AuthContext,
+  sessionId: string,
+  rawSha256: string,
+  chunkIndex: number
+): Promise<Response> {
+  validateSessionId(sessionId);
+  validateChunkIndex(chunkIndex);
+  const row = await env.DB.prepare(
+    `SELECT * FROM session_versions
+     WHERE user_id = ?1 AND session_id = ?2 AND raw_sha256 = ?3
+     LIMIT 1`
+  ).bind(auth.userId, sessionId, rawSha256).first<Record<string, unknown>>();
+  if (!row) {
+    return json({ ok: false, error: "version_not_found" }, 404);
+  }
+  const blobKey = String(row.blob_key || "");
+  if (!blobKey.endsWith(CHUNK_MANIFEST_SUFFIX)) {
+    return json({ ok: false, error: "version_not_chunked" }, 400);
+  }
+  const object = await env.SESSION_BUCKET.get(chunkKey(env, auth.userId, sessionId, rawSha256, chunkIndex));
+  if (!object) {
+    return json({ ok: false, error: "chunk_not_found", index: chunkIndex }, 404);
+  }
+  return withCors(new Response(object.body, {
+    headers: { "content-type": "application/octet-stream" }
   }));
 }
 
@@ -441,6 +701,66 @@ function validateManifest(manifest: SessionManifest, sessionId: string, rawSha25
   if (!/^[a-f0-9]{64}$/.test(manifest.encryptedSha256 || "")) {
     throw new HttpError(400, "invalid_encrypted_sha256");
   }
+}
+
+function validateChunkedManifest(manifest: SessionManifest): void {
+  if (!Number.isSafeInteger(manifest.encryptedSize) || manifest.encryptedSize <= MAX_UPLOAD_BYTES) {
+    throw new HttpError(400, "invalid_chunked_encrypted_size");
+  }
+  if (manifest.encryptedSize > MAX_CHUNKED_UPLOAD_BYTES) {
+    throw new HttpError(413, "chunked_upload_too_large");
+  }
+}
+
+function validateChunkIndex(index: number): void {
+  if (!Number.isSafeInteger(index) || index < 0 || index >= MAX_CHUNK_COUNT) {
+    throw new HttpError(400, "invalid_chunk_index");
+  }
+}
+
+function validateStoredChunkManifest(manifest: ChunkedBlobManifest, sessionId: string, rawSha256: string): void {
+  if (manifest.format !== CHUNK_MANIFEST_FORMAT || manifest.sessionId !== sessionId || manifest.rawSha256 !== rawSha256) {
+    throw new HttpError(500, "invalid_chunk_manifest");
+  }
+  if (!Array.isArray(manifest.chunks) || manifest.chunks.length <= 0 || manifest.chunks.length > MAX_CHUNK_COUNT) {
+    throw new HttpError(500, "invalid_chunk_manifest");
+  }
+}
+
+function chunkKey(env: Env, userId: string, sessionId: string, rawSha256: string, chunkIndex: number): string {
+  return `${objectPrefix(env)}/${userId}/sessions/${sessionId}/versions/${rawSha256}/chunks/${chunkIndex}.part`;
+}
+
+function chunkManifestKey(env: Env, userId: string, sessionId: string, rawSha256: string): string {
+  return `${objectPrefix(env)}/${userId}/sessions/${sessionId}/versions/${rawSha256}${CHUNK_MANIFEST_SUFFIX}`;
+}
+
+function streamChunks(env: Env, manifest: ChunkedBlobManifest): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      try {
+        for (const chunk of manifest.chunks) {
+          const object = await env.SESSION_BUCKET.get(chunk.key);
+          if (!object) {
+            throw new HttpError(404, `chunk_not_found:${chunk.index}`);
+          }
+          const reader = object.body.getReader();
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) {
+              break;
+            }
+            if (value) {
+              controller.enqueue(value);
+            }
+          }
+        }
+        controller.close();
+      } catch (error) {
+        controller.error(error);
+      }
+    }
+  });
 }
 
 function decodeSessionId(value: string): string {
@@ -573,7 +893,10 @@ function withCors(response: Response): Response {
       "authorization",
       "content-type",
       "x-codex-tools-manifest",
-      "x-codex-tools-invite-code"
+      "x-codex-tools-invite-code",
+      "x-codex-tools-force",
+      "x-codex-tools-chunk-sha256",
+      "x-codex-tools-chunk-size"
     ].join(",")
   );
   return next;

@@ -1,8 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use base64::{engine::general_purpose::URL_SAFE, engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use filetime::{set_file_mtime, FileTime};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use rusqlite::{params, Connection, OpenFlags};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -23,6 +25,8 @@ const GLOBAL_STATE_FILE_BASENAME: &str = ".codex-global-state.json";
 const GLOBAL_STATE_BACKUP_FILE_BASENAME: &str = ".codex-global-state.json.bak";
 const SESSION_DIRS: &[&str] = &["sessions", "archived_sessions"];
 const NATIVE_SYNC_ENGINE: &str = "native-rust-rusqlite";
+const CHATGPT_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const RELAY_CONFIG_KEYS: &[&str] = &["base_url", "experimental_bearer_token"];
 
 #[derive(Default)]
 struct TokenCache(Mutex<HashMap<String, String>>);
@@ -155,6 +159,17 @@ struct ApplyTokenResult {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct RelayConfigToggleResult {
+    changed: bool,
+    provider_id: String,
+    commented: bool,
+    changed_keys: Vec<String>,
+    backup_dir: Option<String>,
+    message: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct OpenPathResult {
     opened: bool,
 }
@@ -174,6 +189,121 @@ struct QuitCodexResult {
     still_running: bool,
     processes: Vec<CodexProcess>,
     message: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuotaWindowView {
+    label: String,
+    used_percent: Option<f64>,
+    remaining_percent: Option<f64>,
+    window_minutes: Option<i64>,
+    resets_at: Option<i64>,
+    reset_after_seconds: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuotaBucketView {
+    limit_id: String,
+    limit_name: Option<String>,
+    allowed: Option<bool>,
+    limit_reached: Option<bool>,
+    primary: Option<QuotaWindowView>,
+    secondary: Option<QuotaWindowView>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuotaCreditsView {
+    has_credits: Option<bool>,
+    unlimited: Option<bool>,
+    balance: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SpendControlView {
+    limit: Option<String>,
+    used: Option<String>,
+    remaining: Option<String>,
+    used_percent: Option<f64>,
+    remaining_percent: Option<f64>,
+    resets_at: Option<i64>,
+    reset_after_seconds: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenAiQuotaResult {
+    ok: bool,
+    status: String,
+    auth_mode: Option<String>,
+    account_id_masked: Option<String>,
+    email_masked: Option<String>,
+    plan_type: Option<String>,
+    last_refresh: Option<String>,
+    endpoint: String,
+    fetched_at_unix_ms: u128,
+    buckets: Vec<QuotaBucketView>,
+    credits: Option<QuotaCreditsView>,
+    spend_control: Option<SpendControlView>,
+    rate_limit_reached_type: Option<String>,
+    message: String,
+    recommendation: String,
+}
+
+#[derive(Deserialize)]
+struct AuthDotJsonRaw {
+    auth_mode: Option<String>,
+    #[serde(default)]
+    openai_api_key: Option<String>,
+    tokens: Option<AuthTokensRaw>,
+    last_refresh: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AuthTokensRaw {
+    id_token: String,
+    access_token: String,
+    #[serde(default)]
+    account_id: Option<String>,
+}
+
+struct LocalChatGptAuth {
+    auth_mode: Option<String>,
+    account_id: String,
+    email: Option<String>,
+    plan_type: Option<String>,
+    access_token: String,
+    last_refresh: Option<String>,
+    fedramp: bool,
+}
+
+#[derive(Deserialize)]
+struct JwtClaims {
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(rename = "https://api.openai.com/profile", default)]
+    profile: Option<ProfileClaims>,
+    #[serde(rename = "https://api.openai.com/auth", default)]
+    auth: Option<AuthClaims>,
+}
+
+#[derive(Deserialize)]
+struct ProfileClaims {
+    #[serde(default)]
+    email: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AuthClaims {
+    #[serde(default)]
+    chatgpt_plan_type: Option<String>,
+    #[serde(default)]
+    chatgpt_account_id: Option<String>,
+    #[serde(default)]
+    chatgpt_account_is_fedramp: bool,
 }
 
 struct FirstLineRecord {
@@ -238,6 +368,8 @@ fn main() {
             backup_remove_auth,
             list_auth_token_candidates,
             apply_experimental_token,
+            set_relay_lines_commented,
+            check_openai_quota,
             try_quit_codex,
             open_path
         ])
@@ -552,6 +684,66 @@ fn upsert_key_in_section(
     section.end += 1;
 }
 
+fn relay_assignment_key(text: &str) -> Option<String> {
+    let (left, _right) = text.trim_start().split_once('=')?;
+    let key = left.trim();
+    RELAY_CONFIG_KEYS.contains(&key).then(|| key.to_string())
+}
+
+fn active_relay_assignment_key(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') {
+        return None;
+    }
+    relay_assignment_key(trimmed)
+}
+
+fn commented_relay_assignment_key(line: &str) -> Option<String> {
+    let rest = line.trim_start();
+    let after_hash = rest.strip_prefix('#')?.trim_start();
+    relay_assignment_key(after_hash)
+}
+
+fn comment_toml_line(line: &str) -> String {
+    let indent_len = line.len().saturating_sub(line.trim_start().len());
+    let indent = &line[..indent_len];
+    let content = line[indent_len..].trim_start();
+    format!("{indent}# {content}")
+}
+
+fn uncomment_toml_line(line: &str) -> String {
+    let indent_len = line.len().saturating_sub(line.trim_start().len());
+    let indent = &line[..indent_len];
+    let rest = &line[indent_len..];
+    let after_hash = rest.strip_prefix('#').map(str::trim_start).unwrap_or(rest);
+    format!("{indent}{after_hash}")
+}
+
+fn relay_config_lines_with_comment_state(
+    config_text: &str,
+    section: &ProviderSection,
+    commented: bool,
+) -> (String, Vec<String>) {
+    let mut lines = split_lines(config_text);
+    let mut changed_keys = Vec::new();
+
+    for index in (section.start + 1)..section.end {
+        if commented {
+            if let Some(key) = active_relay_assignment_key(&lines[index]) {
+                lines[index] = comment_toml_line(&lines[index]);
+                changed_keys.push(key);
+            }
+        } else if let Some(key) = commented_relay_assignment_key(&lines[index]) {
+            lines[index] = uncomment_toml_line(&lines[index]);
+            changed_keys.push(key);
+        }
+    }
+
+    changed_keys.sort();
+    changed_keys.dedup();
+    (lines.join("\n"), changed_keys)
+}
+
 fn create_backup(files: &[PathBuf], reason: &str) -> Result<BackupInfo, String> {
     let backup_dir = backup_root()?.join(timestamp_for_path());
     fs::create_dir_all(&backup_dir).map_err(command_error)?;
@@ -622,6 +814,23 @@ fn find_provider_section_for_repair(
             })
             .cloned()
     })
+}
+
+fn find_provider_section_by_id_or_name(
+    sections: &[ProviderSection],
+    provider_id: &str,
+) -> Option<ProviderSection> {
+    sections
+        .iter()
+        .find(|section| {
+            section.id == provider_id
+                || section
+                    .values
+                    .get("name")
+                    .map(|name| name == provider_id)
+                    .unwrap_or(false)
+        })
+        .cloned()
 }
 
 fn state_db_path(codex_home: &Path) -> PathBuf {
@@ -2030,6 +2239,355 @@ fn extract_sk_tokens(text: &str) -> Vec<String> {
     output
 }
 
+fn mask_email(value: &str) -> String {
+    let Some((local, domain)) = value.split_once('@') else {
+        return mask_secret(value);
+    };
+    let mut chars = local.chars();
+    let first = chars.next().unwrap_or('*');
+    let visible_tail = local.chars().rev().next().filter(|_| local.len() > 3);
+    match visible_tail {
+        Some(tail) => format!("{first}***{tail}@{domain}"),
+        None => format!("{first}***@{domain}"),
+    }
+}
+
+fn decode_jwt_payload<T: for<'de> Deserialize<'de>>(jwt: &str) -> Result<T, String> {
+    let parts: Vec<&str> = jwt.split('.').collect();
+    if parts.len() < 3 || parts[1].is_empty() {
+        return Err("JWT 格式无效。".into());
+    }
+    let payload = URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .or_else(|_| URL_SAFE.decode(parts[1]))
+        .map_err(|error| format!("JWT payload base64 解码失败：{error}"))?;
+    serde_json::from_slice::<T>(&payload)
+        .map_err(|error| format!("JWT payload JSON 解析失败：{error}"))
+}
+
+fn load_local_chatgpt_auth_for_quota() -> Result<LocalChatGptAuth, String> {
+    let auth_path = auth_path()?;
+    if !path_exists(&auth_path) {
+        return Err("auth.json 不存在。请先在 Codex 中登录 ChatGPT 账号。".into());
+    }
+    let raw = fs::read_to_string(&auth_path).map_err(command_error)?;
+    let parsed: AuthDotJsonRaw = serde_json::from_str(&raw).map_err(command_error)?;
+    if parsed.openai_api_key.is_some()
+        || parsed
+            .auth_mode
+            .as_deref()
+            .map(|mode| mode.eq_ignore_ascii_case("apikey") || mode.eq_ignore_ascii_case("api_key"))
+            .unwrap_or(false)
+    {
+        return Err(
+            "当前 auth.json 是 API Key 登录，不是 ChatGPT 登录，无法查询 GPT 订阅额度。".into(),
+        );
+    }
+    let tokens = parsed.tokens.ok_or_else(|| {
+        "auth.json 缺少 ChatGPT tokens，请在 Codex 中重新登录 ChatGPT。".to_string()
+    })?;
+    if tokens.access_token.trim().is_empty() {
+        return Err("auth.json 缺少 access_token，请在 Codex 中重新登录 ChatGPT。".into());
+    }
+    let claims: JwtClaims = decode_jwt_payload(&tokens.id_token)?;
+    let auth_claims = claims.auth;
+    let account_id = tokens
+        .account_id
+        .or_else(|| {
+            auth_claims
+                .as_ref()
+                .and_then(|auth| auth.chatgpt_account_id.clone())
+        })
+        .ok_or_else(|| {
+            "auth.json 缺少 ChatGPT account_id，请在 Codex 中重新登录 ChatGPT。".to_string()
+        })?;
+    let email = claims
+        .email
+        .or_else(|| claims.profile.and_then(|profile| profile.email));
+    let plan_type = auth_claims
+        .as_ref()
+        .and_then(|auth| auth.chatgpt_plan_type.clone());
+    let fedramp = auth_claims
+        .as_ref()
+        .map(|auth| auth.chatgpt_account_is_fedramp)
+        .unwrap_or(false);
+
+    Ok(LocalChatGptAuth {
+        auth_mode: parsed.auth_mode,
+        account_id,
+        email,
+        plan_type,
+        access_token: tokens.access_token,
+        last_refresh: parsed.last_refresh,
+        fedramp,
+    })
+}
+
+fn number_as_f64(value: Option<&Value>) -> Option<f64> {
+    value.and_then(|value| match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.parse::<f64>().ok(),
+        _ => None,
+    })
+}
+
+fn number_as_i64(value: Option<&Value>) -> Option<i64> {
+    value.and_then(|value| match value {
+        Value::Number(number) => number.as_i64(),
+        Value::String(text) => text.parse::<i64>().ok(),
+        _ => None,
+    })
+}
+
+fn text_value(value: Option<&Value>) -> Option<String> {
+    value.and_then(|value| match value {
+        Value::String(text) if !text.is_empty() => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    })
+}
+
+fn parse_quota_window(value: Option<&Value>, label: &str) -> Option<QuotaWindowView> {
+    let value = value?;
+    if value.is_null() {
+        return None;
+    }
+    let used_percent = number_as_f64(value.get("used_percent"));
+    let remaining_percent = used_percent.map(|used| (100.0 - used).max(0.0));
+    let limit_window_seconds = number_as_i64(value.get("limit_window_seconds"));
+    Some(QuotaWindowView {
+        label: label.into(),
+        used_percent,
+        remaining_percent,
+        window_minutes: limit_window_seconds.map(|seconds| (seconds + 59) / 60),
+        resets_at: number_as_i64(value.get("reset_at")),
+        reset_after_seconds: number_as_i64(value.get("reset_after_seconds")),
+    })
+}
+
+fn parse_quota_bucket(
+    limit_id: String,
+    limit_name: Option<String>,
+    value: Option<&Value>,
+) -> QuotaBucketView {
+    let details = value.filter(|value| !value.is_null());
+    QuotaBucketView {
+        limit_id,
+        limit_name,
+        allowed: details
+            .and_then(|value| value.get("allowed"))
+            .and_then(Value::as_bool),
+        limit_reached: details
+            .and_then(|value| value.get("limit_reached"))
+            .and_then(Value::as_bool),
+        primary: parse_quota_window(
+            details.and_then(|value| value.get("primary_window")),
+            "primary",
+        ),
+        secondary: parse_quota_window(
+            details.and_then(|value| value.get("secondary_window")),
+            "secondary",
+        ),
+    }
+}
+
+fn parse_quota_payload(
+    payload: &Value,
+) -> (
+    Vec<QuotaBucketView>,
+    Option<QuotaCreditsView>,
+    Option<SpendControlView>,
+    Option<String>,
+    Option<String>,
+) {
+    let plan_type = text_value(payload.get("plan_type"));
+    let mut buckets = vec![parse_quota_bucket(
+        "codex".into(),
+        None,
+        payload.get("rate_limit"),
+    )];
+    if let Some(additional) = payload
+        .get("additional_rate_limits")
+        .and_then(Value::as_array)
+    {
+        for item in additional {
+            let limit_id = text_value(item.get("metered_feature"))
+                .or_else(|| text_value(item.get("limit_name")))
+                .unwrap_or_else(|| "additional".into());
+            let limit_name = text_value(item.get("limit_name"));
+            buckets.push(parse_quota_bucket(
+                limit_id,
+                limit_name,
+                item.get("rate_limit"),
+            ));
+        }
+    }
+
+    let credits = payload
+        .get("credits")
+        .filter(|value| !value.is_null())
+        .map(|value| QuotaCreditsView {
+            has_credits: value.get("has_credits").and_then(Value::as_bool),
+            unlimited: value.get("unlimited").and_then(Value::as_bool),
+            balance: text_value(value.get("balance")),
+        });
+    let spend_control = payload
+        .get("spend_control")
+        .and_then(|value| value.get("individual_limit"))
+        .filter(|value| !value.is_null())
+        .map(|value| SpendControlView {
+            limit: text_value(value.get("limit")),
+            used: text_value(value.get("used")),
+            remaining: text_value(value.get("remaining")),
+            used_percent: number_as_f64(value.get("used_percent")),
+            remaining_percent: number_as_f64(value.get("remaining_percent")),
+            resets_at: number_as_i64(value.get("reset_at")),
+            reset_after_seconds: number_as_i64(value.get("reset_after_seconds")),
+        });
+    let rate_limit_reached_type = payload
+        .get("rate_limit_reached_type")
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    (
+        buckets,
+        credits,
+        spend_control,
+        rate_limit_reached_type,
+        plan_type,
+    )
+}
+
+fn quota_recommendation() -> String {
+    "额度恢复后，完全退出 Codex，点击“切回 GPT 订阅”自动注释 base_url 和 experimental_bearer_token；需要中转时点击“恢复中转”。".into()
+}
+
+fn quota_result_unavailable(
+    status: &str,
+    message: String,
+    auth: Option<LocalChatGptAuth>,
+) -> OpenAiQuotaResult {
+    OpenAiQuotaResult {
+        ok: false,
+        status: status.into(),
+        auth_mode: auth.as_ref().and_then(|auth| auth.auth_mode.clone()),
+        account_id_masked: auth.as_ref().map(|auth| mask_secret(&auth.account_id)),
+        email_masked: auth
+            .as_ref()
+            .and_then(|auth| auth.email.as_ref().map(|email| mask_email(email))),
+        plan_type: auth.as_ref().and_then(|auth| auth.plan_type.clone()),
+        last_refresh: auth.and_then(|auth| auth.last_refresh),
+        endpoint: CHATGPT_USAGE_URL.into(),
+        fetched_at_unix_ms: unix_millis(),
+        buckets: Vec::new(),
+        credits: None,
+        spend_control: None,
+        rate_limit_reached_type: None,
+        message,
+        recommendation: quota_recommendation(),
+    }
+}
+
+#[tauri::command]
+async fn check_openai_quota() -> Result<OpenAiQuotaResult, String> {
+    let auth = match load_local_chatgpt_auth_for_quota() {
+        Ok(auth) => auth,
+        Err(error) => return Ok(quota_result_unavailable("unavailable", error, None)),
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_static("codex-cli"));
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {}", auth.access_token))
+            .map_err(|error| format!("access_token header 无效：{error}"))?,
+    );
+    headers.insert(
+        HeaderName::from_static("chatgpt-account-id"),
+        HeaderValue::from_str(&auth.account_id)
+            .map_err(|error| format!("account_id header 无效：{error}"))?,
+    );
+    if auth.fedramp {
+        headers.insert(
+            HeaderName::from_static("x-openai-fedramp"),
+            HeaderValue::from_static("true"),
+        );
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(command_error)?;
+    let response = match client.get(CHATGPT_USAGE_URL).headers(headers).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            return Ok(quota_result_unavailable(
+                "error",
+                format!("无法连接 OpenAI ChatGPT usage 接口：{error}"),
+                Some(auth),
+            ))
+        }
+    };
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let preview = body.chars().take(320).collect::<String>();
+        return Ok(quota_result_unavailable(
+            "error",
+            format!(
+                "OpenAI usage 接口返回 HTTP {status}，content-type={content_type}，响应摘要：{preview}"
+            ),
+            Some(auth),
+        ));
+    }
+    let payload: Value = match serde_json::from_str(&body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return Ok(quota_result_unavailable(
+                "error",
+                format!("OpenAI usage 响应不是可识别 JSON：{error}"),
+                Some(auth),
+            ))
+        }
+    };
+    let (buckets, credits, spend_control, rate_limit_reached_type, plan_type_from_usage) =
+        parse_quota_payload(&payload);
+    let plan_type = plan_type_from_usage.or_else(|| auth.plan_type.clone());
+    let message = if buckets
+        .iter()
+        .any(|bucket| bucket.limit_reached == Some(true))
+    {
+        "已读取当前 ChatGPT 账号额度，存在已触发的使用限制。".into()
+    } else {
+        "已读取当前 ChatGPT 账号额度。".into()
+    };
+
+    Ok(OpenAiQuotaResult {
+        ok: true,
+        status: "available".into(),
+        auth_mode: auth.auth_mode,
+        account_id_masked: Some(mask_secret(&auth.account_id)),
+        email_masked: auth.email.as_ref().map(|email| mask_email(email)),
+        plan_type,
+        last_refresh: auth.last_refresh,
+        endpoint: CHATGPT_USAGE_URL.into(),
+        fetched_at_unix_ms: unix_millis(),
+        buckets,
+        credits,
+        spend_control,
+        rate_limit_reached_type,
+        message,
+        recommendation: quota_recommendation(),
+    })
+}
+
 #[tauri::command]
 fn inspect() -> Result<InspectState, String> {
     let codex_home = codex_home()?;
@@ -2290,6 +2848,61 @@ fn apply_experimental_token(
 }
 
 #[tauri::command]
+fn set_relay_lines_commented(
+    provider_id: Option<String>,
+    commented: bool,
+) -> Result<RelayConfigToggleResult, String> {
+    ensure_codex_stopped_for_write("切换中转配置注释状态")?;
+    let config_path = config_path()?;
+    let config_text = fs::read_to_string(&config_path).map_err(command_error)?;
+    let target_provider = provider_id
+        .unwrap_or_else(|| parse_root_provider(&config_text))
+        .trim()
+        .to_string();
+    if target_provider.is_empty() {
+        return Err("目标 Provider 不能为空。".into());
+    }
+    let sections = parse_provider_sections(&config_text);
+    let section = find_provider_section_by_id_or_name(&sections, &target_provider)
+        .ok_or_else(|| format!("config.toml 中没有找到 [model_providers.{target_provider}]。"))?;
+    let (next_text, changed_keys) =
+        relay_config_lines_with_comment_state(&config_text, &section, commented);
+    if changed_keys.is_empty() {
+        let action = if commented { "注释" } else { "恢复" };
+        return Ok(RelayConfigToggleResult {
+            changed: false,
+            provider_id: target_provider,
+            commented,
+            changed_keys,
+            backup_dir: None,
+            message: format!("没有找到需要{action}的 base_url 或 experimental_bearer_token 行。"),
+        });
+    }
+
+    let backup = create_backup(&[config_path.clone()], "toggle-relay-config-lines")?;
+    fs::write(&config_path, next_text).map_err(command_error)?;
+    let key_list = changed_keys.join("、");
+    let message = if commented {
+        format!(
+            "已注释 [model_providers.{target_provider}] 中的 {key_list}；重启 Codex 后会优先使用当前 ChatGPT/GPT 订阅登录态。"
+        )
+    } else {
+        format!(
+            "已恢复 [model_providers.{target_provider}] 中的 {key_list}；重启 Codex 后会重新使用中转配置。"
+        )
+    };
+
+    Ok(RelayConfigToggleResult {
+        changed: true,
+        provider_id: target_provider,
+        commented,
+        changed_keys,
+        backup_dir: Some(backup.backup_dir),
+        message,
+    })
+}
+
+#[tauri::command]
 fn try_quit_codex() -> Result<QuitCodexResult, String> {
     let before = detect_codex_processes().map_err(|error| {
         format!("无法检测 Codex 是否正在运行。请手动完全关闭 Codex 后再重试。检测错误：{error}")
@@ -2348,4 +2961,73 @@ fn open_path(target_path: Option<String>) -> Result<OpenPathResult, String> {
     Ok(OpenPathResult {
         opened: status.success(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_comment_state_only_toggles_target_provider_relay_lines() {
+        let config = r#"model_provider = "simplaj"
+
+[model_providers.simplaj]
+name = "simplaj"
+base_url = "https://relay.example/v1"
+wire_api = "responses"
+experimental_bearer_token = "sk-relay"
+requires_openai_auth = true
+
+[model_providers.other]
+name = "other"
+base_url = "https://other.example/v1"
+experimental_bearer_token = "sk-other"
+"#;
+        let sections = parse_provider_sections(config);
+        let target = find_provider_section_by_id_or_name(&sections, "simplaj").unwrap();
+        let (commented, changed_keys) =
+            relay_config_lines_with_comment_state(config, &target, true);
+
+        assert_eq!(
+            changed_keys,
+            vec![
+                "base_url".to_string(),
+                "experimental_bearer_token".to_string()
+            ]
+        );
+        assert!(commented.contains("# base_url = \"https://relay.example/v1\""));
+        assert!(commented.contains("# experimental_bearer_token = \"sk-relay\""));
+        assert!(commented.contains("requires_openai_auth = true"));
+        assert!(commented.contains("base_url = \"https://other.example/v1\""));
+        assert!(commented.contains("experimental_bearer_token = \"sk-other\""));
+    }
+
+    #[test]
+    fn relay_comment_state_can_uncomment_target_provider_relay_lines() {
+        let config = r#"model_provider = "simplaj"
+
+[model_providers.simplaj]
+name = "simplaj"
+# base_url = "https://relay.example/v1"
+wire_api = "responses"
+# experimental_bearer_token = "sk-relay"
+requires_openai_auth = true
+"#;
+        let sections = parse_provider_sections(config);
+        let target = find_provider_section_by_id_or_name(&sections, "simplaj").unwrap();
+        let (uncommented, changed_keys) =
+            relay_config_lines_with_comment_state(config, &target, false);
+
+        assert_eq!(
+            changed_keys,
+            vec![
+                "base_url".to_string(),
+                "experimental_bearer_token".to_string()
+            ]
+        );
+        assert!(uncommented.contains("base_url = \"https://relay.example/v1\""));
+        assert!(uncommented.contains("experimental_bearer_token = \"sk-relay\""));
+        assert!(!uncommented.contains("# base_url = \"https://relay.example/v1\""));
+        assert!(!uncommented.contains("# experimental_bearer_token = \"sk-relay\""));
+    }
 }

@@ -1,6 +1,6 @@
 {
   "name": "gpt-api-tools",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Cross-platform Codex API toolbox for provider repair, history sync, and auth-token wiring.",
   "type": "module",
   "scripts": {

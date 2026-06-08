@@ -47,7 +47,7 @@ select:disabled {
   width: 100%;
   height: 100%;
   display: grid;
-  grid-template-rows: 68px 48px minmax(0, 1fr);
+  grid-template-rows: 76px 50px minmax(0, 1fr);
   gap: 12px;
   padding: 18px;
   overflow: hidden;
@@ -69,15 +69,22 @@ select:disabled {
 }
 
 .brand-mark {
-  width: 44px;
-  height: 44px;
+  width: 50px;
+  height: 50px;
   display: grid;
   flex: 0 0 auto;
   place-items: center;
-  color: #f7fbf8;
-  background: #20372c;
+  background: #ffffff;
+  border: 1px solid #d7e2db;
   border-radius: 8px;
-  box-shadow: 0 10px 24px rgba(32, 55, 44, 0.18);
+  box-shadow: 0 10px 24px rgba(32, 55, 44, 0.12);
+  overflow: hidden;
+}
+
+.brand-mark img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
 }
 
 h1 {
@@ -102,6 +109,26 @@ p {
   text-overflow: ellipsis;
 }
 
+.support-link {
+  margin-top: 5px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: min(64vw, 760px);
+  color: #1f6d45;
+  font-size: 12px;
+  font-weight: 720;
+  text-decoration: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.support-link:hover {
+  color: #164f34;
+  text-decoration: underline;
+}
+
 .top-actions {
   display: flex;
   align-items: center;
@@ -110,10 +137,11 @@ p {
 }
 
 .view-tabs {
-  display: inline-flex;
+  display: grid;
+  grid-template-columns: minmax(220px, 1.35fr) minmax(132px, 0.75fr) minmax(122px, 0.65fr) minmax(104px, 0.55fr);
   align-items: center;
   align-self: start;
-  width: fit-content;
+  width: 100%;
   max-width: 100%;
   min-width: 0;
   padding: 4px;
@@ -129,15 +157,22 @@ p {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 7px;
-  padding: 0 14px;
+  gap: 6px;
+  min-width: 0;
+  padding: 0 10px;
   color: #405249;
   background: transparent;
   border: 0;
   border-radius: 7px;
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 760;
   white-space: nowrap;
+}
+
+.view-tabs button span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .view-tabs button.active {
@@ -167,6 +202,10 @@ p {
 
 .remote-view {
   grid-template-columns: minmax(260px, 0.82fr) minmax(230px, 0.78fr) minmax(300px, 1fr);
+}
+
+.quota-view {
+  grid-template-columns: minmax(250px, 0.82fr) minmax(330px, 1.1fr) minmax(300px, 0.92fr);
 }
 
 .status-view {
@@ -635,6 +674,215 @@ select:focus {
   min-width: 0;
 }
 
+.quota-check-panel,
+.quota-result-panel,
+.quota-guidance-panel {
+  display: grid;
+  align-content: start;
+}
+
+.quota-action {
+  margin-top: 16px;
+}
+
+.quota-facts {
+  margin-top: 14px;
+}
+
+.quota-content {
+  margin-top: 14px;
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.quota-message {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 7px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.quota-message.ok {
+  color: #1e5c39;
+  background: #e8f4ec;
+  border: 1px solid #c5e5d0;
+}
+
+.quota-message.warn {
+  color: #75401b;
+  background: #fff3e6;
+  border: 1px solid #efcfad;
+}
+
+.quota-card {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  background: #fbfcfb;
+  border: 1px solid #dce5df;
+  border-radius: 8px;
+}
+
+.quota-card > div:first-child {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  font-size: 13px;
+}
+
+.quota-card strong,
+.quota-card span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.quota-card strong {
+  color: #25362e;
+}
+
+.quota-card span {
+  color: #68756e;
+}
+
+.quota-meter {
+  display: grid;
+  gap: 8px;
+}
+
+.quota-meter-track {
+  height: 10px;
+  overflow: hidden;
+  background: #e9efeb;
+  border-radius: 999px;
+}
+
+.quota-meter-track span {
+  display: block;
+  height: 100%;
+  background: #2d7450;
+  border-radius: inherit;
+}
+
+.quota-meter-copy,
+.quota-bucket-list div,
+.quota-credit-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  color: #64716a;
+  font-size: 12px;
+}
+
+.quota-bucket-list {
+  display: grid;
+  gap: 8px;
+}
+
+.quota-bucket-list div {
+  min-height: 34px;
+  padding: 0 10px;
+  background: #f7faf8;
+  border: 1px solid #dde6e0;
+  border-radius: 7px;
+}
+
+.quota-bucket-list span,
+.quota-bucket-list b,
+.quota-credit-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.quota-bucket-list b {
+  color: #26372f;
+  font-weight: 740;
+}
+
+.quota-credit-row {
+  justify-content: flex-start;
+  min-height: 34px;
+  padding: 0 10px;
+  background: #f7faf8;
+  border: 1px solid #dde6e0;
+  border-radius: 7px;
+}
+
+.quota-switch-target {
+  margin-top: 14px;
+}
+
+.quota-switch-actions {
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 9px;
+  min-width: 0;
+}
+
+.quota-close-inline {
+  margin-top: 12px;
+  display: grid;
+  gap: 9px;
+  min-width: 0;
+}
+
+.inline-confirm {
+  margin-top: 0;
+  padding: 9px;
+  background: #f8faf8;
+  border: 1px solid #dce5df;
+  border-radius: 7px;
+  font-size: 12px;
+}
+
+.guidance-steps {
+  margin-top: 14px;
+  display: grid;
+  gap: 10px;
+}
+
+.guidance-steps div {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 9px;
+  align-items: start;
+  min-width: 0;
+  color: #2d3d34;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.guidance-steps b {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  color: #f7fbf8;
+  background: #244536;
+  border-radius: 999px;
+  font-size: 12px;
+}
+
+.guidance-steps code {
+  padding: 1px 4px;
+  color: #193a2a;
+  background: #e9f1ec;
+  border-radius: 4px;
+  font: 12px/1.4 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
 .warning-box {
   margin-top: 12px;
   display: flex;
@@ -683,6 +931,31 @@ select:focus {
 }
 
 @media (max-width: 1100px) {
+  .app-shell {
+    grid-template-rows: 76px 50px minmax(0, 1fr);
+  }
+
+  .view-tabs {
+    grid-template-columns: minmax(190px, 1.25fr) minmax(118px, 0.7fr) minmax(106px, 0.62fr) minmax(88px, 0.5fr);
+  }
+
+  .sync-view,
+  .remote-view,
+  .quota-view,
+  .status-view {
+    gap: 10px;
+  }
+
+  .sync-view {
+    grid-template-columns: minmax(240px, 0.74fr) minmax(0, 1.26fr);
+  }
+
+  .remote-view,
+  .quota-view,
+  .status-view {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
   .sync-layout {
     grid-template-columns: 1fr;
   }
@@ -699,12 +972,13 @@ select:focus {
 
 @media (max-width: 760px) {
   .app-shell {
-    grid-template-rows: 64px 46px minmax(0, 1fr);
+    grid-template-rows: 66px 48px minmax(0, 1fr);
     padding: 12px;
     gap: 10px;
   }
 
   .brand-block p,
+  .support-link,
   .top-actions .status-pill:first-child {
     display: none;
   }
@@ -714,18 +988,20 @@ select:focus {
   }
 
   .view-tabs button {
-    flex: 1 1 0;
-    padding: 0 8px;
+    padding: 0 6px;
+    font-size: 12px;
   }
 
   .sync-view,
   .remote-view,
+  .quota-view,
   .status-view {
     grid-template-columns: 1fr;
   }
 
   .sync-view,
   .remote-view,
+  .quota-view,
   .status-view {
     grid-auto-rows: minmax(0, auto);
   }
@@ -745,7 +1021,8 @@ select:focus {
   }
 
   .candidate-row,
-  .control-strip {
+  .control-strip,
+  .quota-switch-actions {
     grid-template-columns: 1fr;
   }
 }

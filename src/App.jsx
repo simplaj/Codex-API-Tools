@@ -3,18 +3,25 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   AlertTriangle,
   Archive,
+  BadgeDollarSign,
   CheckCircle2,
+  Clock3,
   DatabaseZap,
+  ExternalLink,
   FolderOpen,
+  Gauge,
   KeyRound,
   Loader2,
   Power,
+  PlugZap,
   RefreshCcw,
   RotateCcw,
   ShieldCheck,
   TerminalSquare,
+  Wallet,
   Wrench
 } from "lucide-react";
+import simplajLogo from "./assets/simplaj-logo.png";
 
 const isTauriRuntime = () => Boolean(window.__TAURI_INTERNALS__);
 
@@ -86,6 +93,54 @@ async function callTauri(command, args) {
   if (command === "apply_experimental_token") {
     return { applied: true, providerId: args?.providerId || "simplaj", tokenMasked: "sk-...demo", backupDir: "preview" };
   }
+  if (command === "set_relay_lines_commented") {
+    const commented = Boolean(args?.commented);
+    return {
+      changed: true,
+      providerId: args?.providerId || "simplaj",
+      commented,
+      changedKeys: ["base_url", "experimental_bearer_token"],
+      backupDir: "preview",
+      message: commented
+        ? "Preview mode: 已注释 base_url 和 experimental_bearer_token。"
+        : "Preview mode: 已恢复 base_url 和 experimental_bearer_token。"
+    };
+  }
+  if (command === "check_openai_quota") {
+    return {
+      ok: true,
+      status: "available",
+      authMode: "chatgpt",
+      accountIdMasked: "acc...demo",
+      emailMasked: "u***r@example.com",
+      planType: "pro",
+      lastRefresh: new Date().toISOString(),
+      endpoint: "https://chatgpt.com/backend-api/wham/usage",
+      fetchedAtUnixMs: Date.now(),
+      buckets: [
+        {
+          limitId: "codex",
+          limitName: null,
+          allowed: true,
+          limitReached: false,
+          primary: {
+            label: "primary",
+            usedPercent: 42,
+            remainingPercent: 58,
+            windowMinutes: 300,
+            resetsAt: Math.floor(Date.now() / 1000) + 3600,
+            resetAfterSeconds: 3600
+          },
+          secondary: null
+        }
+      ],
+      credits: { hasCredits: true, unlimited: false, balance: "preview" },
+      spendControl: null,
+      rateLimitReachedType: null,
+      message: "Preview mode: 已读取当前 ChatGPT 账号额度。",
+      recommendation: "额度恢复后，完全退出 Codex，点击“切回 GPT 订阅”自动注释 base_url 和 experimental_bearer_token；需要中转时点击“恢复中转”。"
+    };
+  }
   if (command === "try_quit_codex") {
     return {
       attempted: false,
@@ -110,6 +165,11 @@ const api = {
     candidateId,
     token
   }),
+  setRelayLinesCommented: ({ providerId, commented }) => callTauri("set_relay_lines_commented", {
+    providerId,
+    commented
+  }),
+  checkOpenAIQuota: () => callTauri("check_openai_quota"),
   openPath: ({ targetPath }) => callTauri("open_path", { targetPath })
 };
 
@@ -185,6 +245,39 @@ function LogPanel({ logs, onClear }) {
   );
 }
 
+function formatPercent(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return "-";
+  return `${Math.round(Number(value))}%`;
+}
+
+function formatResetTime(seconds) {
+  if (!seconds) return "-";
+  const date = new Date(Number(seconds) * 1000);
+  if (Number.isNaN(date.getTime())) return "-";
+  return date.toLocaleString();
+}
+
+function windowLabel(window) {
+  if (!window) return "未返回";
+  const duration = window.windowMinutes ? `${window.windowMinutes} 分钟窗口` : "使用窗口";
+  return `${duration} · 剩余 ${formatPercent(window.remainingPercent)}`;
+}
+
+function QuotaMeter({ window }) {
+  const used = Math.max(0, Math.min(100, Number(window?.usedPercent ?? 0)));
+  return (
+    <div className="quota-meter">
+      <div className="quota-meter-track">
+        <span style={{ width: `${used}%` }} />
+      </div>
+      <div className="quota-meter-copy">
+        <span>已用 {formatPercent(window?.usedPercent)}</span>
+        <span>恢复 {formatResetTime(window?.resetsAt)}</span>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [state, setState] = useState(null);
   const [customName, setCustomName] = useState("simplaj");
@@ -193,6 +286,7 @@ export default function App() {
   const [manualToken, setManualToken] = useState("");
   const [selectedCandidate, setSelectedCandidate] = useState("");
   const [tokenCandidates, setTokenCandidates] = useState([]);
+  const [quotaResult, setQuotaResult] = useState(null);
   const [logs, setLogs] = useState([]);
   const [busy, setBusy] = useState("");
   const [codexClosedForWrite, setCodexClosedForWrite] = useState(false);
@@ -274,6 +368,22 @@ export default function App() {
     });
   }
 
+  async function checkOpenAIQuota() {
+    return runAction("查询 OpenAI 当前登录额度", async () => {
+      const result = await api.checkOpenAIQuota();
+      setQuotaResult(result);
+      return result;
+    });
+  }
+
+  async function setRelayLinesCommented(commented) {
+    const label = commented ? "切回 GPT 订阅" : "恢复中转";
+    return runAction(label, async () => api.setRelayLinesCommented({
+      providerId: selectedProviderValue,
+      commented
+    }));
+  }
+
   const runtimeTone = state?.runtime?.nodeRequiredForSync ? "warn" : "ok";
   const canUseConfig = Boolean(state?.configExists);
   const isBusy = Boolean(busy);
@@ -285,7 +395,7 @@ export default function App() {
     : codexRunning
       ? `检测到 ${state?.codexProcesses?.length || 0} 个进程`
       : "未检测到进程";
-  const visibleView = activeView === "remote" ? "remote" : activeView === "status" ? "status" : "sync";
+  const visibleView = ["sync", "remote", "quota", "status"].includes(activeView) ? activeView : "sync";
 
   const writeGuard = (
     <section className="tool-section attention-section guard-panel">
@@ -337,7 +447,7 @@ export default function App() {
       <section className="tool-section sync-panel">
         <div className="section-title">
           <DatabaseZap size={18} />
-          <span>Provider 修复与会话同步</span>
+          <span>修复远程压缩问题并同步会话历史</span>
           {openAIProvider ? <StatusPill tone="warn">检测到 OpenAI</StatusPill> : <StatusPill tone="ok">Provider 已避开 OpenAI</StatusPill>}
         </div>
         <div className="sync-layout">
@@ -473,6 +583,151 @@ export default function App() {
     </section>
   );
 
+  const quotaBuckets = quotaResult?.buckets || [];
+  const primaryQuota = quotaBuckets.find((bucket) => bucket.limitId === "codex") || quotaBuckets[0];
+  const quotaView = (
+    <section className="view-panel quota-view">
+      <section className="tool-section quota-check-panel">
+        <div className="section-title">
+          <Gauge size={18} />
+          <span>OpenAI 当前登录额度</span>
+          <StatusPill tone={quotaResult?.ok ? "ok" : quotaResult ? "warn" : "neutral"}>
+            {quotaResult?.status || "未查询"}
+          </StatusPill>
+        </div>
+        <button
+          className="primary-button full quota-action"
+          disabled={isBusy}
+          onClick={checkOpenAIQuota}
+        >
+          {busy === "查询 OpenAI 当前登录额度" ? <Loader2 className="spin" size={17} /> : <Gauge size={17} />}
+          查询当前 OpenAI 登录额度
+        </button>
+        <p className="step-note">
+          使用当前 Codex 的 ChatGPT 登录态只读查询官方 usage 接口；不会写入 config.toml，也不会展示 token。
+        </p>
+        {quotaResult ? (
+          <dl className="facts quota-facts">
+            <div><dt>账号</dt><dd>{quotaResult.emailMasked || quotaResult.accountIdMasked || "-"}</dd></div>
+            <div><dt>套餐</dt><dd>{quotaResult.planType || "-"}</dd></div>
+            <div><dt>auth</dt><dd>{quotaResult.authMode || "-"}</dd></div>
+            <div><dt>last_refresh</dt><dd>{quotaResult.lastRefresh || "-"}</dd></div>
+          </dl>
+        ) : (
+          <div className="empty-line">点击查询后会显示账号摘要、使用窗口和恢复时间。</div>
+        )}
+      </section>
+
+      <section className="tool-section quota-result-panel">
+        <div className="section-title">
+          <BadgeDollarSign size={18} />
+          <span>额度窗口</span>
+          <StatusPill tone={primaryQuota?.limitReached ? "warn" : primaryQuota ? "ok" : "neutral"}>
+            {primaryQuota ? (primaryQuota.limitReached ? "已触发限制" : "可用") : "无数据"}
+          </StatusPill>
+        </div>
+        {quotaResult ? (
+          <div className="quota-content">
+            <div className={quotaResult.ok ? "quota-message ok" : "quota-message warn"}>
+              {quotaResult.ok ? <CheckCircle2 size={17} /> : <AlertTriangle size={17} />}
+              <span>{quotaResult.message}</span>
+            </div>
+            {primaryQuota?.primary ? (
+              <div className="quota-card">
+                <div>
+                  <strong>{primaryQuota.limitName || primaryQuota.limitId}</strong>
+                  <span>{windowLabel(primaryQuota.primary)}</span>
+                </div>
+                <QuotaMeter window={primaryQuota.primary} />
+              </div>
+            ) : null}
+            {quotaBuckets.length > 1 ? (
+              <div className="quota-bucket-list">
+                {quotaBuckets.slice(1, 4).map((bucket) => (
+                  <div key={bucket.limitId}>
+                    <span>{bucket.limitName || bucket.limitId}</span>
+                    <b>{windowLabel(bucket.primary)}</b>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+            {quotaResult.credits ? (
+              <div className="quota-credit-row">
+                <Wallet size={16} />
+                <span>
+                  Credits: {quotaResult.credits.unlimited ? "unlimited" : quotaResult.credits.balance || (quotaResult.credits.hasCredits ? "available" : "unavailable")}
+                </span>
+              </div>
+            ) : null}
+          </div>
+        ) : (
+          <div className="empty-line">暂无额度结果。</div>
+        )}
+      </section>
+
+      <section className="tool-section quota-guidance-panel">
+        <div className="section-title">
+          <Clock3 size={18} />
+          <span>订阅 / 中转切换</span>
+          <StatusPill tone={canWriteCodexState ? "ok" : "warn"}>
+            {canWriteCodexState ? "可写入" : "需关闭 Codex"}
+          </StatusPill>
+        </div>
+        <div className="quota-switch-target">
+          <label>
+            <span>目标 Provider</span>
+            <select value={selectedProviderValue} onChange={(event) => setSelectedProvider(event.target.value)}>
+              {providerChoices.map((providerId) => (
+                <option key={providerId} value={providerId}>{providerId}</option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <div className="quota-switch-actions">
+          <button
+            className="primary-button full"
+            disabled={isBusy || !canWriteCodexState}
+            onClick={() => setRelayLinesCommented(true)}
+          >
+            {busy === "切回 GPT 订阅" ? <Loader2 className="spin" size={17} /> : <Gauge size={17} />}
+            切回 GPT 订阅
+          </button>
+          <button
+            className="secondary-button full"
+            disabled={isBusy || !canWriteCodexState}
+            onClick={() => setRelayLinesCommented(false)}
+          >
+            <PlugZap size={17} />
+            恢复中转
+          </button>
+        </div>
+        <div className="guidance-steps">
+          <div><b>1</b><span>额度恢复后，先完全退出 Codex。</span></div>
+          <div><b>2</b><span>点“切回 GPT 订阅”，自动备份并注释 <code>base_url</code> 和 <code>experimental_bearer_token</code>。</span></div>
+          <div><b>3</b><span>重启 Codex，使用当前 ChatGPT 订阅。</span></div>
+        </div>
+        <p className="step-note">
+          {quotaResult?.recommendation || "中转用于额度不足或断流兜底；额度恢复后建议切回订阅。"}
+        </p>
+        <div className="quota-close-inline">
+          <button className="ghost-button full" disabled={isBusy} onClick={requestCodexQuit}>
+            {busy === "尝试退出 Codex" ? <Loader2 className="spin" size={16} /> : <Power size={16} />}
+            尝试退出 Codex
+          </button>
+          <label className="close-confirm inline-confirm">
+            <input
+              type="checkbox"
+              checked={codexClosedForWrite}
+              onChange={(event) => setCodexClosedForWrite(event.target.checked)}
+              disabled={codexRunning}
+            />
+            <span>已完全退出 Codex，可以写入切换配置。</span>
+          </label>
+        </div>
+      </section>
+    </section>
+  );
+
   const statusView = (
     <section className="view-panel status-view">
       <section className="tool-section status-panel">
@@ -532,10 +787,16 @@ export default function App() {
     <main className="app-shell">
       <header className="topbar">
         <div className="brand-block">
-          <div className="brand-mark"><Wrench size={22} /></div>
+          <div className="brand-mark">
+            <img src={simplajLogo} alt="Simplaj" />
+          </div>
           <div>
             <h1>Codex API 工具箱</h1>
             <p>{state?.codexHome || "正在读取 Codex 目录..."}</p>
+            <a className="support-link" href="https://sub2api.simplaj.top/" target="_blank" rel="noreferrer">
+              稳定中转 技术支持来自 sub2api.simplaj.top
+              <ExternalLink size={12} />
+            </a>
           </div>
         </div>
         <div className="top-actions">
@@ -551,13 +812,14 @@ export default function App() {
         </div>
       </header>
       <nav className="view-tabs">
-        <ViewTab active={visibleView === "sync"} icon={<DatabaseZap size={17} />} label="同步修复" onClick={() => setActiveView("sync")} />
-        <ViewTab active={visibleView === "remote"} icon={<ShieldCheck size={17} />} label="远程插件" onClick={() => setActiveView("remote")} />
+        <ViewTab active={visibleView === "sync"} icon={<DatabaseZap size={17} />} label="修复远程压缩问题并同步会话历史" onClick={() => setActiveView("sync")} />
+        <ViewTab active={visibleView === "remote"} icon={<ShieldCheck size={17} />} label="远程插件解锁" onClick={() => setActiveView("remote")} />
+        <ViewTab active={visibleView === "quota"} icon={<PlugZap size={17} />} label="OpenAI 额度" onClick={() => setActiveView("quota")} />
         <ViewTab active={visibleView === "status"} icon={<TerminalSquare size={17} />} label="状态日志" onClick={() => setActiveView("status")} />
       </nav>
 
       <div className="view-host">
-        {visibleView === "remote" ? remoteView : visibleView === "status" ? statusView : syncView}
+        {visibleView === "remote" ? remoteView : visibleView === "quota" ? quotaView : visibleView === "status" ? statusView : syncView}
       </div>
     </main>
   );

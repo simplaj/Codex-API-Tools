@@ -1,6 +1,6 @@
 # Codex API Tools
 
-Windows/macOS desktop toolbox for Codex provider repair, history synchronization, and `experimental_bearer_token` wiring.
+Windows/macOS desktop toolbox for Codex provider repair, history synchronization, remote/plugin unlock, and OpenAI account quota checks.
 
 ## Features
 
@@ -10,6 +10,9 @@ Windows/macOS desktop toolbox for Codex provider repair, history synchronization
 - Detects running Codex App / Codex CLI / app-server processes before writes, can request Codex App to quit, and blocks state writes until Codex is fully closed. If process detection itself fails, writes are blocked and the user is asked to quit Codex manually before retrying.
 - Backs up and removes `~/.codex/auth.json` for the remote/plugin login flow.
 - Writes `experimental_bearer_token = "sk-..."` into a selected `[model_providers.NAME]` section.
+- Queries the current ChatGPT login quota through OpenAI's `wham/usage` endpoint using the local Codex ChatGPT login token, showing masked account info, plan type, usage windows, reset time, credits, and a clear fallback message when the endpoint is unavailable or the login is not ChatGPT-based.
+- Can automatically comment or uncomment only the current provider's `base_url` and `experimental_bearer_token` lines, so users can switch between GPT subscription mode and relay mode without manually editing `config.toml`.
+- Uses the Simplaj logo in the app header and links to `https://sub2api.simplaj.top/` for stable relay and technical support.
 - Backs up touched files under `~/.codex/backups_state/gpt-api-tools/<timestamp>`.
 
 ## User Flow
@@ -24,6 +27,8 @@ Windows/macOS desktop toolbox for Codex provider repair, history synchronization
 8. After GPT login finishes, fully quit Codex again.
 9. Load the backed-up Simplaj API key or enter one manually, then write it as `experimental_bearer_token` under the target provider.
 10. Restart Codex App so the new provider/auth combination is picked up.
+11. In "OpenAI 额度", query the current ChatGPT account's Codex usage window. When quota has recovered, fully quit Codex, tick the closed confirmation, then click "切回 GPT 订阅"; the app backs up `config.toml` and comments the selected provider's `base_url` and `experimental_bearer_token` lines.
+12. To switch back to the relay later, fully quit Codex, tick the same confirmation, then click "恢复中转"; the app backs up `config.toml` and uncomments those two lines.
 
 Do not write `config.toml`, `state_5.sqlite`, rollout files, or `.codex-global-state.json` while Codex is running. Codex can keep SQLite locked or rewrite `config.toml` on exit, which may hide histories again or discard the injected token. The app enforces this in the backend for provider repair, metadata sync, `auth.json` removal, and token writing, and fails closed if it cannot confirm the Codex process state.
 
@@ -37,6 +42,18 @@ The sync flow mirrors `codex-provider-sync sync`: it does not switch ChatGPT log
 - `~/.codex/.codex-global-state.json`
 
 If old rollouts contain `encrypted_content` from another provider or account, this can restore list visibility, but continuing or compacting those exact histories can still fail upstream because encrypted content is account/provider-bound.
+
+## OpenAI Quota Check
+
+The quota query itself is read-only. It reads `~/.codex/auth.json`, extracts only the ChatGPT account id, email/plan claims, and access token needed for the request, then calls:
+
+```text
+GET https://chatgpt.com/backend-api/wham/usage
+```
+
+The request matches Codex's own ChatGPT usage path by sending `Authorization: Bearer <access_token>` and `ChatGPT-Account-Id`. The UI masks account identifiers and never prints tokens. If `auth.json` is missing, uses API-key auth, has expired tokens, or the OpenAI endpoint rejects the request, the app reports the exact safe failure summary and keeps the switch controls visible.
+
+The switch controls are write operations and are protected by the same Codex process guard as provider repair and token injection. They only comment/uncomment `base_url` and `experimental_bearer_token` inside the selected `[model_providers.NAME]` section; they do not change `requires_openai_auth` or other provider fields.
 
 ## Runtime Requirements
 
@@ -63,7 +80,7 @@ npm run dist:win
 GitHub Actions builds and publishes desktop releases with `.github/workflows/release.yml`.
 
 - Pushing to `main` creates a release tag like `codex-api-tools-v__VERSION__-<run_number>`.
-- Pushing a version tag such as `v0.1.0` publishes to that tag.
+- Pushing a version tag such as `v0.1.1` publishes to that tag.
 - The matrix builds macOS Apple Silicon, macOS Intel, and Windows x64 installers.
 - macOS CI builds use ad-hoc signing. Windows artifacts are unsigned unless signing secrets are added later.
 

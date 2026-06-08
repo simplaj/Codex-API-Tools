@@ -6,11 +6,12 @@ use reqwest::blocking::{Client, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, BufRead, ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SESSION_DIRS: &[&str] = &["sessions", "archived_sessions"];
@@ -18,6 +19,10 @@ const ENVELOPE_FORMAT: &str = "codex-tools-session-v1";
 const USER_AGENT_VALUE: &str = "codex-tools-cloud-sync/0.1.1";
 const DEFAULT_API_URL: &str = "https://codex-tools-sync-api.821099891.workers.dev";
 const DEFAULT_INVITE_CODE: &str = "sub2api.simplaj.top";
+const DEFAULT_HTTP_RETRIES: usize = 4;
+const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 180;
+const DEFAULT_HTTP_CONNECT_TIMEOUT_SECS: u64 = 20;
+const MAX_DECOMPRESSED_SESSION_BYTES: usize = 512 * 1024 * 1024;
 
 struct ApiClient {
     api_url: String,
@@ -37,7 +42,7 @@ struct RegistrationRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct LocalSession {
+struct LocalSessionMeta {
     session_id: String,
     relative_path: String,
     source_dir: String,
@@ -47,7 +52,6 @@ struct LocalSession {
     model: Option<String>,
     modified_at_ms: u128,
     size: u64,
-    raw_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +132,7 @@ struct ApiManifestResponse {
     error: Option<String>,
     message: Option<String>,
     manifest: Option<SessionManifest>,
+    skipped: Option<bool>,
 }
 
 fn main() {
@@ -156,7 +161,9 @@ fn run_sessions(args: &[String]) -> Result<(), String> {
             let codex_home = option_path(args, "--codex-home")?.unwrap_or(codex_home()?);
             let json = flag(args, "--json");
             let limit = option_usize(args, "--limit")?.unwrap_or(50);
-            let sessions = collect_local_sessions(&codex_home)?;
+            let mut sessions = collect_local_session_metas(&codex_home)?;
+            let total = sessions.len();
+            sessions.truncate(limit);
             if json {
                 println!(
                     "{}",
@@ -164,8 +171,8 @@ fn run_sessions(args: &[String]) -> Result<(), String> {
                 );
                 return Ok(());
             }
-            println!("local sessions: {}", sessions.len());
-            for session in sessions.iter().take(limit) {
+            println!("local sessions: {total}");
+            for session in &sessions {
                 println!(
                     "{}  {}  {}  {}",
                     session.session_id,
@@ -174,8 +181,8 @@ fn run_sessions(args: &[String]) -> Result<(), String> {
                     session.relative_path
                 );
             }
-            if sessions.len() > limit {
-                println!("... {} more", sessions.len() - limit);
+            if total > sessions.len() {
+                println!("... {} more", total - sessions.len());
             }
             Ok(())
         }
@@ -358,6 +365,7 @@ fn cloud_push_api(args: &[String], api: &ApiClient) -> Result<(), String> {
     let codex_home = option_path(args, "--codex-home")?.unwrap_or(codex_home()?);
     let session_filter = option_value(args, "--session-id");
     let all = flag(args, "--all");
+    let force = flag(args, "--force");
     let limit = option_usize(args, "--limit")?;
     let device_name = option_value(args, "--device").unwrap_or_else(default_device_name);
 
@@ -365,7 +373,7 @@ fn cloud_push_api(args: &[String], api: &ApiClient) -> Result<(), String> {
         return Err("cloud push requires --all or --session-id <id>".into());
     }
 
-    let mut sessions = collect_local_sessions(&codex_home)?;
+    let mut sessions = collect_local_session_metas(&codex_home)?;
     if let Some(session_id) = session_filter {
         sessions.retain(|session| session.session_id == session_id);
     }
@@ -377,11 +385,55 @@ fn cloud_push_api(args: &[String], api: &ApiClient) -> Result<(), String> {
     }
 
     let mut uploaded = 0usize;
+    let mut skipped = 0usize;
+    let mut local_seen = HashSet::new();
     for session in sessions {
         let raw_path = codex_home.join(&session.relative_path);
+        println!(
+            "checking {}  {} bytes  {}",
+            session.session_id, session.size, session.relative_path
+        );
         let raw = fs::read(&raw_path).map_err(to_error)?;
+        let raw_sha256 = sha256_hex(&raw);
+
+        let version_key = format!("{}\0{}", session.session_id, raw_sha256);
+        if !local_seen.insert(version_key) {
+            skipped += 1;
+            println!(
+                "skipped {}: duplicate local version {}",
+                session.session_id, raw_sha256
+            );
+            continue;
+        }
+
+        if !force {
+            match api.latest_version_optional(&session.session_id) {
+                Ok(Some(remote)) if remote.raw_sha256 == raw_sha256 => {
+                    skipped += 1;
+                    println!(
+                        "skipped {}: already uploaded {}",
+                        session.session_id, raw_sha256
+                    );
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    return Err(format!(
+                        "cannot verify remote state for {} before upload: {}\nRe-run with --force to upload without the preflight duplicate check.",
+                        session.session_id, error
+                    ));
+                }
+            }
+        }
+
         let encrypted = encrypt_payload(&raw, &passphrase)?;
         let encrypted_sha256 = sha256_hex(&encrypted);
+        println!(
+            "uploading {}: raw {}, encrypted {} bytes",
+            session.session_id,
+            raw_sha256,
+            encrypted.len()
+        );
         let manifest = SessionManifest {
             format: ENVELOPE_FORMAT.into(),
             session_id: session.session_id.clone(),
@@ -391,22 +443,30 @@ fn cloud_push_api(args: &[String], api: &ApiClient) -> Result<(), String> {
             cwd: session.cwd.clone(),
             provider_name: session.provider_name.clone(),
             model: session.model.clone(),
-            raw_sha256: session.raw_sha256.clone(),
+            raw_sha256: raw_sha256.clone(),
             encrypted_sha256,
             encrypted_size: encrypted.len(),
             blob_key: String::new(),
             uploaded_at_ms: unix_millis(),
             device_name: device_name.clone(),
         };
-        let result = api.put_version(&manifest, encrypted)?;
+        let result = api.put_version(&manifest, encrypted, force)?;
         if !result.ok {
             return Err(api_error("push", result.error, result.message));
         }
+        if result.skipped.unwrap_or(false) {
+            skipped += 1;
+            println!(
+                "skipped {}: already existed on API {}",
+                session.session_id, raw_sha256
+            );
+            continue;
+        }
         uploaded += 1;
-        println!("uploaded {} -> API", session.session_id);
+        println!("uploaded {} -> API {}", session.session_id, raw_sha256);
     }
 
-    println!("cloud push ok: uploaded {uploaded} session version(s)");
+    println!("cloud push ok: uploaded {uploaded}, skipped {skipped}");
     Ok(())
 }
 
@@ -518,14 +578,14 @@ fn latest_manifests(manifests: Vec<SessionManifest>) -> Vec<SessionManifest> {
     output
 }
 
-fn collect_local_sessions(codex_home: &Path) -> Result<Vec<LocalSession>, String> {
+fn collect_local_session_metas(codex_home: &Path) -> Result<Vec<LocalSessionMeta>, String> {
     let mut paths = Vec::new();
     for dir_name in SESSION_DIRS {
         list_rollout_files(&codex_home.join(dir_name), &mut paths)?;
     }
     let mut sessions = Vec::new();
     for path in paths {
-        if let Some(session) = read_local_session(codex_home, &path)? {
+        if let Some(session) = read_local_session_meta(codex_home, &path)? {
             sessions.push(session);
         }
     }
@@ -538,10 +598,17 @@ fn collect_local_sessions(codex_home: &Path) -> Result<Vec<LocalSession>, String
     Ok(sessions)
 }
 
-fn read_local_session(codex_home: &Path, path: &Path) -> Result<Option<LocalSession>, String> {
-    let bytes = fs::read(path).map_err(to_error)?;
-    let first_line = first_line(&bytes);
-    let parsed: Value = match serde_json::from_slice(first_line) {
+fn read_local_session_meta(
+    codex_home: &Path,
+    path: &Path,
+) -> Result<Option<LocalSessionMeta>, String> {
+    let file = fs::File::open(path).map_err(to_error)?;
+    let mut reader = io::BufReader::new(file);
+    let mut line = String::new();
+    if reader.read_line(&mut line).map_err(to_error)? == 0 {
+        return Ok(None);
+    }
+    let parsed: Value = match serde_json::from_str(line.trim_end_matches(&['\r', '\n'][..])) {
         Ok(value) => value,
         Err(_) => return Ok(None),
     };
@@ -571,7 +638,7 @@ fn read_local_session(codex_home: &Path, path: &Path) -> Result<Option<LocalSess
         .next()
         .unwrap_or("sessions")
         .to_string();
-    Ok(Some(LocalSession {
+    Ok(Some(LocalSessionMeta {
         session_id: session_id.to_string(),
         relative_path,
         source_dir,
@@ -593,7 +660,6 @@ fn read_local_session(codex_home: &Path, path: &Path) -> Result<Option<LocalSess
             .map(ToString::to_string),
         modified_at_ms,
         size: metadata.len(),
-        raw_sha256: sha256_hex(&bytes),
     }))
 }
 
@@ -664,7 +730,8 @@ fn decrypt_payload(envelope: &[u8], passphrase: &str) -> Result<Vec<u8>, String>
     let compressed = cipher
         .decrypt(XNonce::from_slice(&nonce), &envelope[newline + 1..])
         .map_err(|error| error.to_string())?;
-    let raw = zstd::bulk::decompress(&compressed, 64 * 1024 * 1024).map_err(to_error)?;
+    let raw =
+        zstd::bulk::decompress(&compressed, MAX_DECOMPRESSED_SESSION_BYTES).map_err(to_error)?;
     if sha256_hex(&raw) != header.raw_sha256 {
         return Err("decrypted payload hash mismatch".into());
     }
@@ -685,8 +752,15 @@ impl ApiClient {
         admin_bootstrap_token: Option<String>,
         sync_passphrase: Option<String>,
     ) -> Result<Self, String> {
+        let timeout_secs = optional_env("CODEX_TOOLS_HTTP_TIMEOUT_SECS")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_HTTP_TIMEOUT_SECS);
+        let connect_timeout_secs = optional_env("CODEX_TOOLS_HTTP_CONNECT_TIMEOUT_SECS")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_HTTP_CONNECT_TIMEOUT_SECS);
         let client = Client::builder()
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(timeout_secs))
+            .connect_timeout(Duration::from_secs(connect_timeout_secs))
             .build()
             .map_err(to_error)?;
         Ok(Self {
@@ -716,41 +790,43 @@ impl ApiClient {
     }
 
     fn health(&self) -> Result<ApiStatusResponse, String> {
-        let response = self
-            .client
-            .get(self.url("/v1/health"))
-            .header("user-agent", USER_AGENT_VALUE)
-            .send()
-            .map_err(to_error)?;
+        let response = self.send_with_retries("health", || {
+            self.client
+                .get(self.url("/v1/health"))
+                .header("user-agent", USER_AGENT_VALUE)
+        })?;
         read_json_response(response, "health")
     }
 
     fn register(&self, registration: &RegistrationRequest) -> Result<ApiRegisterResponse, String> {
-        let mut request = self
-            .client
-            .post(self.url("/v1/devices/register"))
-            .header("user-agent", USER_AGENT_VALUE)
-            .json(&json!({
-                "email": registration.email.as_str(),
-                "deviceName": registration.device_name.as_str(),
-                "platform": registration.platform.as_str(),
-                "inviteCode": registration.invite_code.as_deref()
-            }));
-        if let Some(token) = self.admin_bootstrap_token.as_ref() {
-            request = request.bearer_auth(token);
-        }
-        let response = request.send().map_err(to_error)?;
+        let payload = json!({
+            "email": registration.email.as_str(),
+            "deviceName": registration.device_name.as_str(),
+            "platform": registration.platform.as_str(),
+            "inviteCode": registration.invite_code.as_deref()
+        });
+        let response = self.send_with_retries("register", || {
+            let mut request = self
+                .client
+                .post(self.url("/v1/devices/register"))
+                .header("user-agent", USER_AGENT_VALUE)
+                .json(&payload);
+            if let Some(token) = self.admin_bootstrap_token.as_ref() {
+                request = request.bearer_auth(token);
+            }
+            request
+        })?;
         read_json_response(response, "register")
     }
 
     fn list_sessions(&self, limit: usize) -> Result<ApiSessionsResponse, String> {
-        let response = self
-            .client
-            .get(self.url(&format!("/v1/sessions?limit={limit}")))
-            .header("user-agent", USER_AGENT_VALUE)
-            .bearer_auth(self.required_device_token()?)
-            .send()
-            .map_err(to_error)?;
+        let token = self.required_device_token()?.to_string();
+        let response = self.send_with_retries("list sessions", || {
+            self.client
+                .get(self.url(&format!("/v1/sessions?limit={limit}")))
+                .header("user-agent", USER_AGENT_VALUE)
+                .bearer_auth(token.as_str())
+        })?;
         read_json_response(response, "list sessions")
     }
 
@@ -758,6 +834,7 @@ impl ApiClient {
         &self,
         manifest: &SessionManifest,
         encrypted: Vec<u8>,
+        force: bool,
     ) -> Result<ApiManifestResponse, String> {
         let manifest_header = STANDARD.encode(serde_json::to_vec(manifest).map_err(to_error)?);
         let path = format!(
@@ -765,32 +842,49 @@ impl ApiClient {
             percent_encode_path(&manifest.session_id),
             manifest.raw_sha256
         );
-        let response = self
-            .client
-            .put(self.url(&path))
-            .header("user-agent", USER_AGENT_VALUE)
-            .header("content-type", "application/octet-stream")
-            .header("x-codex-tools-manifest", manifest_header)
-            .bearer_auth(self.required_device_token()?)
-            .body(encrypted)
-            .send()
-            .map_err(to_error)?;
+        let token = self.required_device_token()?.to_string();
+        let response = self.send_with_retries("put version", || {
+            self.client
+                .put(self.url(&path))
+                .header("user-agent", USER_AGENT_VALUE)
+                .header("content-type", "application/octet-stream")
+                .header("x-codex-tools-manifest", manifest_header.as_str())
+                .header("x-codex-tools-force", if force { "true" } else { "false" })
+                .bearer_auth(token.as_str())
+                .body(encrypted.clone())
+        })?;
         read_json_response(response, "put version")
     }
 
     fn latest_version(&self, session_id: &str) -> Result<ApiManifestResponse, String> {
+        let response = self.latest_version_response(session_id)?;
+        read_json_response(response, "latest version")
+    }
+
+    fn latest_version_optional(&self, session_id: &str) -> Result<Option<SessionManifest>, String> {
+        let response = self.latest_version_response(session_id)?;
+        if response.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let result: ApiManifestResponse = read_json_response(response, "latest version")?;
+        if !result.ok {
+            return Err(api_error("latest", result.error, result.message));
+        }
+        Ok(result.manifest)
+    }
+
+    fn latest_version_response(&self, session_id: &str) -> Result<Response, String> {
         let path = format!(
             "/v1/sessions/{}/versions/latest",
             percent_encode_path(session_id)
         );
-        let response = self
-            .client
-            .get(self.url(&path))
-            .header("user-agent", USER_AGENT_VALUE)
-            .bearer_auth(self.required_device_token()?)
-            .send()
-            .map_err(to_error)?;
-        read_json_response(response, "latest version")
+        let token = self.required_device_token()?.to_string();
+        self.send_with_retries("latest version", || {
+            self.client
+                .get(self.url(&path))
+                .header("user-agent", USER_AGENT_VALUE)
+                .bearer_auth(token.as_str())
+        })
     }
 
     fn get_blob(&self, session_id: &str, raw_sha256: &str) -> Result<Vec<u8>, String> {
@@ -799,14 +893,49 @@ impl ApiClient {
             percent_encode_path(session_id),
             raw_sha256
         );
-        let response = self
-            .client
-            .get(self.url(&path))
-            .header("user-agent", USER_AGENT_VALUE)
-            .bearer_auth(self.required_device_token()?)
-            .send()
-            .map_err(to_error)?;
+        let token = self.required_device_token()?.to_string();
+        let response = self.send_with_retries("get blob", || {
+            self.client
+                .get(self.url(&path))
+                .header("user-agent", USER_AGENT_VALUE)
+                .bearer_auth(token.as_str())
+        })?;
         read_success_bytes(response, "get blob")
+    }
+
+    fn send_with_retries<F>(&self, action: &str, mut build: F) -> Result<Response, String>
+    where
+        F: FnMut() -> reqwest::blocking::RequestBuilder,
+    {
+        let retries = optional_env("CODEX_TOOLS_HTTP_RETRIES")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_HTTP_RETRIES);
+        let max_attempts = retries.saturating_add(1).max(1);
+        let mut last_error = None;
+        for attempt in 1..=max_attempts {
+            match build().send() {
+                Ok(response)
+                    if should_retry_status(response.status().as_u16())
+                        && attempt < max_attempts =>
+                {
+                    let status = response.status();
+                    eprintln!("{action}: HTTP {status}, retrying ({attempt}/{max_attempts})...");
+                    sleep_before_retry(attempt);
+                    continue;
+                }
+                Ok(response) => return Ok(response),
+                Err(error) if attempt < max_attempts && is_retryable_reqwest_error(&error) => {
+                    let message = network_error_message(error);
+                    eprintln!("{action}: {message}, retrying ({attempt}/{max_attempts})...");
+                    last_error = Some(message);
+                    sleep_before_retry(attempt);
+                }
+                Err(error) => {
+                    return Err(network_error_message(error));
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| format!("{action} failed after retries")))
     }
 
     fn required_device_token(&self) -> Result<&str, String> {
@@ -853,21 +982,42 @@ where
     serde_json::from_str(&body).map_err(|error| format!("{action} returned invalid JSON: {error}"))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+fn should_retry_status(status: u16) -> bool {
+    matches!(
+        status,
+        408 | 425 | 429 | 500 | 502 | 503 | 504 | 520 | 521 | 522 | 523 | 524 | 525 | 526
+    )
 }
 
-fn first_line(bytes: &[u8]) -> &[u8] {
-    let end = bytes
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .unwrap_or(bytes.len());
-    let end = if end > 0 && bytes[end - 1] == b'\r' {
-        end - 1
+fn is_retryable_reqwest_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
+}
+
+fn sleep_before_retry(attempt: usize) {
+    let shift = attempt.saturating_sub(1).min(4) as u32;
+    let millis = 500u64.saturating_mul(2u64.saturating_pow(shift));
+    thread::sleep(Duration::from_millis(millis));
+}
+
+fn network_error_message(error: reqwest::Error) -> String {
+    let kind = if error.is_timeout() {
+        "network timeout"
+    } else if error.is_connect() {
+        "network connect/TLS failure"
+    } else if error.is_body() {
+        "network stream/body interrupted"
+    } else if error.is_request() {
+        "network request failure"
     } else {
-        end
+        "network failure"
     };
-    &bytes[..end]
+    format!(
+        "{kind}: {error}. This can happen before the request reaches the Worker, so the server may not show an error log. Retry, or set HTTP_PROXY/HTTPS_PROXY if your network needs a proxy."
+    )
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn relative_path(root: &Path, path: &Path) -> Result<String, String> {
@@ -1081,8 +1231,8 @@ Usage:
   codex-tools cloud logout
   codex-tools cloud register --email EMAIL [--device NAME] [--platform NAME] [--invite-code CODE]
   codex-tools cloud smoke
-  codex-tools cloud push --all [--limit N] [--device NAME] [--codex-home PATH]
-  codex-tools cloud push --session-id ID [--device NAME] [--codex-home PATH]
+  codex-tools cloud push --all [--limit N] [--device NAME] [--codex-home PATH] [--force]
+  codex-tools cloud push --session-id ID [--device NAME] [--codex-home PATH] [--force]
   codex-tools cloud list [--json]
   codex-tools cloud pull --session-id ID [--codex-home PATH] [--dry-run] [--force]
 
@@ -1090,6 +1240,7 @@ Run `codex-tools cloud login` once to save local cloud configuration.
 Environment variables CODEX_TOOLS_API_URL, CODEX_TOOLS_DEVICE_TOKEN, and
 CODEX_TOOLS_SYNC_PASSPHRASE are optional overrides for automation.
 New device registration sends invite code sub2api.simplaj.top by default.
+Cloud push skips already uploaded versions by default; use --force to re-upload.
 "#
     .to_string()
 }

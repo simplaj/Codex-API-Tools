@@ -120,6 +120,7 @@ codex-tools sessions list --json
 # Upload one session or all local session versions.
 codex-tools cloud push --session-id <session-id>
 codex-tools cloud push --all --limit 20
+codex-tools cloud push --all --force
 
 # List latest cloud versions by session id.
 codex-tools cloud list
@@ -144,8 +145,17 @@ Environment variables are optional overrides for CI or temporary automation:
 - `CODEX_TOOLS_DEVICE_NAME`
 - `CODEX_TOOLS_INVITE_CODE`
 - `CODEX_TOOLS_ADMIN_BOOTSTRAP_TOKEN`
+- `CODEX_TOOLS_HTTP_RETRIES`
+- `CODEX_TOOLS_HTTP_TIMEOUT_SECS`
+- `CODEX_TOOLS_HTTP_CONNECT_TIMEOUT_SECS`
 
 `cloud register` is kept for debugging and admin automation, but normal users should use `cloud login`. A correct admin bootstrap token bypasses the invite code and registration rate limit for controlled automation.
+
+`cloud push` is idempotent by default. Before uploading, the CLI checks the latest cloud version for the same session and skips it when the remote `raw_sha256` already matches the local file. The Worker also skips an already stored `session_id + raw_sha256` before reading the upload body, so a retry after a lost response will not re-upload the same blob. Use `--force` only when you intentionally want to bypass the duplicate preflight and rewrite an existing version.
+
+If Codex is still writing an active rollout file, the same session id can produce a new `raw_sha256` on every run. That is treated as a new session version, not a duplicate. Close or pause Codex before a final backup if you want a stable snapshot.
+
+If the CLI reports a TLS, connection, timeout, or body-stream failure but the Worker dashboard has no matching error, the request may have failed before it reached Cloudflare or before the response reached the client. Increase `CODEX_TOOLS_HTTP_RETRIES` when the local network is unstable. Lower `CODEX_TOOLS_HTTP_CONNECT_TIMEOUT_SECS` to fail and retry stuck connection attempts faster; increase `CODEX_TOOLS_HTTP_TIMEOUT_SECS` only for very large uploads.
 
 After restoring sessions on a machine that uses a different provider name, run the provider metadata sync so the histories are visible under the current provider:
 

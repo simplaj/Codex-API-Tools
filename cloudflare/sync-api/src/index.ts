@@ -162,6 +162,10 @@ function validateInviteCode(env: Env, inviteCode: string | null): void {
   }
 }
 
+function forceUpload(request: Request): boolean {
+  return (request.headers.get("x-codex-tools-force") || "").toLowerCase() === "true";
+}
+
 async function handleListSessions(
   request: Request,
   env: Env,
@@ -200,6 +204,22 @@ async function handlePutVersion(
 ): Promise<Response> {
   const manifest = parseManifestHeader(request.headers.get("x-codex-tools-manifest"));
   validateManifest(manifest, sessionId, rawSha256);
+
+  if (!forceUpload(request)) {
+    const existing = await env.DB.prepare(
+      `SELECT * FROM session_versions
+       WHERE user_id = ?1 AND session_id = ?2 AND raw_sha256 = ?3
+       LIMIT 1`
+    ).bind(auth.userId, sessionId, rawSha256).first<Record<string, unknown>>();
+    if (existing) {
+      await audit(env, auth.userId, auth.deviceId, "session.upload.skip_existing", sessionId);
+      return json({
+        ok: true,
+        skipped: true,
+        manifest: rowToManifest(existing)
+      });
+    }
+  }
 
   const encrypted = await request.arrayBuffer();
   if (encrypted.byteLength <= 0) {

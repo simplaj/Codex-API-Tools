@@ -8,6 +8,9 @@ on:
     tags:
       - "v*"
       - "codex-api-tools-v*"
+    paths-ignore:
+      - "README.md"
+      - "docs/**"
 
 permissions:
   contents: write

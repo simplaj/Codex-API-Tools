@@ -26,6 +26,59 @@ Manual release assets:
 - `codex-tools-cli-linux-x64`
 - `codex-tools-cli-checksums.txt`
 
+## Quick Start
+
+After installation, first check the local Codex state:
+
+```bash
+codex-tools status
+codex-tools provider status
+```
+
+If you changed the provider name in `config.toml`, changed to a relay provider, restored sessions from another machine, or installed Codex on a new machine and cannot see old chats, sync the session metadata to the provider name that this machine is using:
+
+```bash
+codex-tools provider sync --provider simplaj
+```
+
+Replace `simplaj` with the provider name shown in `codex-tools provider status` if you use a different name. This command does not log in or out of ChatGPT and does not rewrite message content. It only updates local session visibility metadata so Codex can show the history under the selected provider name.
+
+Typical first-run local repair:
+
+```bash
+codex-tools codex quit
+codex-tools provider repair --name simplaj
+codex-tools provider sync --provider simplaj
+```
+
+Back up sessions from one machine and restore them on another:
+
+On the source machine, close Codex first so the latest rollout files are flushed, then log in and upload all local sessions:
+
+```bash
+codex-tools codex quit
+codex-tools cloud login --email user@example.com
+codex-tools cloud push --all -n 8
+```
+
+On the target machine, use the same email and the same Sync key, then download the cloud sessions:
+
+```bash
+codex-tools codex quit
+codex-tools cloud login --email user@example.com
+codex-tools cloud list
+codex-tools cloud pull --all -n 8
+```
+
+If the target machine uses a different provider name, run provider sync after `cloud pull` or the restored sessions may not show up in the Codex UI:
+
+```bash
+codex-tools provider status
+codex-tools provider sync --provider simplaj
+```
+
+Use the provider name from `provider status` if it is not `simplaj`. The cloud backup uploads encrypted session rollouts only; it does not upload `auth.json`, `config.toml`, API keys, ChatGPT tokens, or the raw Sync key.
+
 ## Local Codex Tools
 
 Always close Codex before write operations. The CLI detects Codex App, Codex CLI, and app-server processes before touching `config.toml`, `state_5.sqlite`, rollout files, or `.codex-global-state.json`. If detection fails, close Codex manually and retry.
@@ -80,7 +133,15 @@ codex-tools quota --raw-json
 
 ## Sync Semantics
 
-Provider sync does not switch ChatGPT login state and does not rewrite message history content. It updates visibility metadata so histories belonging to older provider names become visible under the selected provider:
+Codex stores history visibility metadata with the provider name. If `config.toml` changes from `openai` to `simplaj`, or from one relay name to another, the rollout files can still exist locally but disappear from the Codex UI because their metadata points at the old provider name.
+
+Run this after a provider name change, after `provider repair`, or after `cloud pull` downloads sessions onto a machine whose provider name is different:
+
+```bash
+codex-tools provider sync --provider simplaj
+```
+
+Provider sync does not switch ChatGPT login state and does not rewrite message history content. It updates visibility metadata so histories belonging to older provider names become visible under the selected provider. The affected local data is:
 
 - `~/.codex/sessions/**/rollout-*.jsonl`
 - `~/.codex/archived_sessions/**/rollout-*.jsonl`
@@ -144,11 +205,20 @@ codex-tools cloud login --email user@example.com
 
 Then enter the original Sync key and retry `cloud pull`.
 
-After restoring sessions on a machine that uses a different provider name, run:
+After restoring sessions on a machine that uses a different provider name, run `provider sync` so Codex shows those sessions under the current provider:
 
 ```bash
 codex-tools provider sync --provider simplaj
 ```
+
+If the sessions are still not visible, run:
+
+```bash
+codex-tools provider status
+codex-tools sessions list --limit 20
+```
+
+Use the provider name from `provider status` in the `provider sync --provider <name>` command.
 
 ## Cloudflare Backend
 

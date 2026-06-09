@@ -2,6 +2,8 @@ use base64::{engine::general_purpose::URL_SAFE, engine::general_purpose::URL_SAF
 use filetime::{set_file_mtime, FileTime};
 use reqwest::blocking::Client as BlockingClient;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use rusqlite::params_from_iter;
+use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -289,9 +291,30 @@ struct RolloutChange {
     updated_first_line: String,
 }
 
+#[derive(Debug, Clone)]
+struct RolloutIndexRecord {
+    path: PathBuf,
+    thread_id: String,
+    cwd: String,
+    title: String,
+    source: String,
+    thread_source: String,
+    cli_version: String,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    sandbox_policy: String,
+    approval_mode: String,
+    created_at: i64,
+    updated_at: i64,
+    has_user_event: bool,
+    first_user_message: String,
+    archived: bool,
+}
+
 #[derive(Default)]
 struct RolloutScan {
     changes: Vec<RolloutChange>,
+    index_records: Vec<RolloutIndexRecord>,
     provider_counts: HashMap<String, usize>,
     user_event_thread_ids: HashSet<String>,
     thread_cwd_by_id: HashMap<String, String>,
@@ -299,6 +322,7 @@ struct RolloutScan {
 
 #[derive(Default)]
 struct SqliteUpdateStats {
+    thread_rows_inserted: usize,
     provider_rows_updated: usize,
     user_event_rows_updated: usize,
     cwd_rows_updated: usize,
@@ -320,6 +344,48 @@ struct WorkspaceRootSyncStats {
     updated_workspace_roots: usize,
     saved_workspace_root_count: usize,
 }
+
+#[derive(Default)]
+struct RolloutContentDetails {
+    has_user_event: bool,
+    first_user_message: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    sandbox_policy: Option<String>,
+    approval_mode: Option<String>,
+}
+
+const THREAD_INSERT_COLUMN_ORDER: &[&str] = &[
+    "id",
+    "rollout_path",
+    "created_at",
+    "updated_at",
+    "source",
+    "model_provider",
+    "cwd",
+    "title",
+    "sandbox_policy",
+    "approval_mode",
+    "tokens_used",
+    "has_user_event",
+    "archived",
+    "archived_at",
+    "git_sha",
+    "git_branch",
+    "git_origin_url",
+    "cli_version",
+    "first_user_message",
+    "agent_nickname",
+    "agent_role",
+    "memory_mode",
+    "model",
+    "reasoning_effort",
+    "agent_path",
+    "created_at_ms",
+    "updated_at_ms",
+    "thread_source",
+    "preview",
+];
 
 fn command_error(error: impl ToString) -> String {
     error.to_string()
@@ -968,21 +1034,240 @@ fn record_has_user_event(record: &Value) -> bool {
     false
 }
 
-fn file_has_user_event(path: &Path) -> Result<bool, String> {
+fn extract_text_from_content(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Value::Array(items) => {
+            let text = items
+                .iter()
+                .filter_map(|item| {
+                    if let Some(text) = item.get("text").and_then(Value::as_str) {
+                        return Some(text.trim().to_string());
+                    }
+                    if let Some(text) = item.get("content").and_then(Value::as_str) {
+                        return Some(text.trim().to_string());
+                    }
+                    item.as_str().map(|text| text.trim().to_string())
+                })
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        }
+        Value::Object(map) => map
+            .get("text")
+            .or_else(|| map.get("content"))
+            .and_then(extract_text_from_content),
+        _ => None,
+    }
+}
+
+fn looks_like_environment_context(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.starts_with("<environment_context>")
+        || trimmed.starts_with("# AGENTS.md instructions")
+        || trimmed.starts_with("<permissions instructions>")
+        || trimmed.starts_with("<collaboration_mode>")
+}
+
+fn user_message_text(record: &Value) -> Option<String> {
+    if record.get("type").and_then(Value::as_str) == Some("event_msg") {
+        let payload = record.get("payload")?;
+        if payload.get("type").and_then(Value::as_str) == Some("user_message") {
+            let text = payload
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(ToString::to_string);
+            if let Some(text) = text {
+                if !looks_like_environment_context(&text) {
+                    return Some(text);
+                }
+            }
+        }
+    }
+
+    for key in ["payload", "item", "msg"] {
+        let Some(value) = record.get(key) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("message")
+            || value.get("role").and_then(Value::as_str) != Some("user")
+        {
+            continue;
+        }
+        let Some(text) = value.get("content").and_then(extract_text_from_content) else {
+            continue;
+        };
+        if !looks_like_environment_context(&text) {
+            return Some(text);
+        }
+    }
+
+    None
+}
+
+fn collect_rollout_content_details(path: &Path) -> Result<RolloutContentDetails, String> {
     let file = fs::File::open(path).map_err(command_error)?;
     let reader = BufReader::new(file);
+    let mut details = RolloutContentDetails::default();
+    let mut saw_turn_context = false;
+
     for line in reader.lines() {
         let line = line.map_err(command_error)?;
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(record) = serde_json::from_str::<Value>(&line) {
-            if record_has_user_event(&record) {
-                return Ok(true);
+        let Ok(record) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if record_has_user_event(&record) {
+            details.has_user_event = true;
+        }
+        if details.first_user_message.is_none() {
+            details.first_user_message = user_message_text(&record);
+        }
+        if record.get("type").and_then(Value::as_str) == Some("turn_context") {
+            saw_turn_context = true;
+            if let Some(payload) = record.get("payload").and_then(Value::as_object) {
+                if details.model.is_none() {
+                    details.model = payload
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .map(ToString::to_string);
+                }
+                if details.reasoning_effort.is_none() {
+                    details.reasoning_effort = payload
+                        .get("effort")
+                        .or_else(|| {
+                            payload
+                                .get("collaboration_mode")
+                                .and_then(|mode| mode.get("settings"))
+                                .and_then(|settings| settings.get("reasoning_effort"))
+                        })
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .map(ToString::to_string);
+                }
+                if details.sandbox_policy.is_none() {
+                    if let Some(sandbox_policy) = payload.get("sandbox_policy") {
+                        details.sandbox_policy =
+                            Some(serde_json::to_string(sandbox_policy).map_err(command_error)?);
+                    }
+                }
+                if details.approval_mode.is_none() {
+                    details.approval_mode = payload
+                        .get("approval_policy")
+                        .or_else(|| payload.get("approval_mode"))
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .map(ToString::to_string);
+                }
             }
         }
+        if details.has_user_event && details.first_user_message.is_some() && saw_turn_context {
+            break;
+        }
     }
-    Ok(false)
+
+    Ok(details)
+}
+
+fn session_id_unix_seconds(session_id: &str) -> Option<i64> {
+    let hex = session_id
+        .chars()
+        .filter(|character| *character != '-')
+        .take(12)
+        .collect::<String>();
+    if hex.len() != 12 {
+        return None;
+    }
+    u64::from_str_radix(&hex, 16)
+        .ok()
+        .map(|millis| (millis / 1000) as i64)
+}
+
+fn system_time_unix_seconds(value: SystemTime) -> Option<i64> {
+    value
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs() as i64)
+}
+
+fn file_modified_unix_seconds(path: &Path) -> Option<i64> {
+    fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(system_time_unix_seconds)
+}
+
+fn payload_string(payload: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn rollout_index_record(
+    rollout_path: &Path,
+    dir_name: &str,
+    payload: &serde_json::Map<String, Value>,
+    _current_provider: &str,
+) -> Result<Option<RolloutIndexRecord>, String> {
+    let Some(thread_id) = payload_string(payload, "id") else {
+        return Ok(None);
+    };
+    let content = collect_rollout_content_details(rollout_path)?;
+    let cwd = payload_string(payload, "cwd")
+        .map(|value| to_normal_workspace_path(&value))
+        .unwrap_or_default();
+    let fallback_title = format!("Restored session {thread_id}");
+    let first_user_message = content
+        .first_user_message
+        .clone()
+        .or_else(|| payload_string(payload, "title"))
+        .unwrap_or_else(|| fallback_title.clone());
+    let title = payload_string(payload, "title").unwrap_or_else(|| first_user_message.clone());
+    let created_at = session_id_unix_seconds(&thread_id)
+        .or_else(|| file_modified_unix_seconds(rollout_path))
+        .unwrap_or_else(|| (unix_millis() / 1000) as i64);
+    let updated_at = file_modified_unix_seconds(rollout_path).unwrap_or(created_at);
+
+    Ok(Some(RolloutIndexRecord {
+        path: rollout_path.to_path_buf(),
+        thread_id,
+        cwd,
+        title,
+        source: payload_string(payload, "source").unwrap_or_else(|| "vscode".into()),
+        thread_source: payload_string(payload, "thread_source").unwrap_or_else(|| "user".into()),
+        cli_version: payload_string(payload, "cli_version").unwrap_or_default(),
+        model: content.model,
+        reasoning_effort: content.reasoning_effort,
+        sandbox_policy: content
+            .sandbox_policy
+            .unwrap_or_else(|| json!({"type": "disabled"}).to_string()),
+        approval_mode: content.approval_mode.unwrap_or_else(|| "never".into()),
+        created_at,
+        updated_at: updated_at.max(created_at),
+        has_user_event: content.has_user_event,
+        first_user_message,
+        archived: dir_name == "archived_sessions",
+    }))
 }
 
 fn list_rollout_files(root: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -1048,6 +1333,11 @@ fn collect_rollout_scan(
             let count_key = format!("{dir_name}/{current_provider}");
             *scan.provider_counts.entry(count_key).or_insert(0) += 1;
 
+            let index_record = if target_provider.is_some() {
+                rollout_index_record(&rollout_path, dir_name, payload, &current_provider)?
+            } else {
+                None
+            };
             let thread_id = payload
                 .get("id")
                 .and_then(Value::as_str)
@@ -1062,15 +1352,15 @@ fn collect_rollout_scan(
                 scan.thread_cwd_by_id.insert(thread_id.clone(), cwd.clone());
             }
 
-            let has_user_event = if thread_id.is_some() {
-                file_has_user_event(&rollout_path)?
-            } else {
-                false
-            };
-            if has_user_event {
-                if let Some(thread_id) = thread_id.as_ref() {
-                    scan.user_event_thread_ids.insert(thread_id.clone());
+            let has_user_event = index_record
+                .as_ref()
+                .map(|record| record.has_user_event)
+                .unwrap_or(false);
+            if let Some(record) = index_record {
+                if record.has_user_event {
+                    scan.user_event_thread_ids.insert(record.thread_id.clone());
                 }
+                scan.index_records.push(record);
             }
 
             if let Some(target_provider) = target_provider {
@@ -1641,6 +1931,123 @@ fn assert_sqlite_writable(codex_home: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
+fn sqlite_quote_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn sqlite_thread_insert_value(
+    record: &RolloutIndexRecord,
+    column: &str,
+    target_provider: &str,
+) -> Option<SqlValue> {
+    let value = match column {
+        "id" => SqlValue::Text(record.thread_id.clone()),
+        "rollout_path" => SqlValue::Text(path_to_string(&record.path)),
+        "created_at" => SqlValue::Integer(record.created_at),
+        "updated_at" => SqlValue::Integer(record.updated_at),
+        "source" => SqlValue::Text(record.source.clone()),
+        "model_provider" => SqlValue::Text(target_provider.to_string()),
+        "cwd" => SqlValue::Text(record.cwd.clone()),
+        "title" => SqlValue::Text(record.title.clone()),
+        "sandbox_policy" => SqlValue::Text(record.sandbox_policy.clone()),
+        "approval_mode" => SqlValue::Text(record.approval_mode.clone()),
+        "tokens_used" => SqlValue::Integer(0),
+        "has_user_event" => SqlValue::Integer(if record.has_user_event { 1 } else { 0 }),
+        "archived" => SqlValue::Integer(if record.archived { 1 } else { 0 }),
+        "archived_at" => SqlValue::Null,
+        "git_sha" => SqlValue::Null,
+        "git_branch" => SqlValue::Null,
+        "git_origin_url" => SqlValue::Null,
+        "cli_version" => SqlValue::Text(record.cli_version.clone()),
+        "first_user_message" => SqlValue::Text(record.first_user_message.clone()),
+        "agent_nickname" => SqlValue::Null,
+        "agent_role" => SqlValue::Null,
+        "memory_mode" => SqlValue::Text("enabled".into()),
+        "model" => record
+            .model
+            .clone()
+            .map(SqlValue::Text)
+            .unwrap_or(SqlValue::Null),
+        "reasoning_effort" => record
+            .reasoning_effort
+            .clone()
+            .map(SqlValue::Text)
+            .unwrap_or(SqlValue::Null),
+        "agent_path" => SqlValue::Null,
+        "created_at_ms" => SqlValue::Integer(record.created_at.saturating_mul(1000)),
+        "updated_at_ms" => SqlValue::Integer(record.updated_at.saturating_mul(1000)),
+        "thread_source" => SqlValue::Text(record.thread_source.clone()),
+        "preview" => SqlValue::Text(record.first_user_message.clone()),
+        _ => return None,
+    };
+    Some(value)
+}
+
+fn insert_missing_sqlite_thread_indexes(
+    tx: &rusqlite::Transaction<'_>,
+    columns: &HashSet<String>,
+    scan: &RolloutScan,
+    target_provider: &str,
+) -> Result<usize, String> {
+    if scan.index_records.is_empty() || !columns.contains("id") {
+        return Ok(0);
+    }
+
+    let insert_columns = THREAD_INSERT_COLUMN_ORDER
+        .iter()
+        .copied()
+        .filter(|column| columns.contains(*column))
+        .collect::<Vec<_>>();
+    if insert_columns.is_empty() {
+        return Ok(0);
+    }
+
+    let escaped_columns = insert_columns
+        .iter()
+        .map(|column| sqlite_quote_identifier(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let placeholders = (1..=insert_columns.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let insert_sql = format!("INSERT INTO threads ({escaped_columns}) VALUES ({placeholders})");
+
+    let mut inserted = 0usize;
+    let mut exists_stmt = tx
+        .prepare("SELECT 1 FROM threads WHERE id = ?1 LIMIT 1")
+        .map_err(|error| sqlite_error("检查 SQLite thread 索引", error))?;
+    let mut insert_stmt = tx
+        .prepare(&insert_sql)
+        .map_err(|error| sqlite_error("插入 SQLite thread 索引", error))?;
+
+    for record in &scan.index_records {
+        if record.thread_id.trim().is_empty() {
+            continue;
+        }
+        let exists = exists_stmt
+            .exists(params![record.thread_id])
+            .map_err(|error| sqlite_error("检查 SQLite thread 索引", error))?;
+        if exists {
+            continue;
+        }
+
+        let values = insert_columns
+            .iter()
+            .filter_map(|column| sqlite_thread_insert_value(record, column, target_provider))
+            .collect::<Vec<_>>();
+        if values.len() != insert_columns.len() {
+            continue;
+        }
+        insert_stmt
+            .execute(params_from_iter(values.iter()))
+            .map_err(|error| sqlite_error("插入 SQLite thread 索引", error))?;
+        inserted += 1;
+    }
+
+    Ok(inserted)
+}
+
 fn update_sqlite_provider(
     codex_home: &Path,
     target_provider: &str,
@@ -1663,6 +2070,9 @@ fn update_sqlite_provider(
         database_present: true,
         ..Default::default()
     };
+
+    stats.thread_rows_inserted =
+        insert_missing_sqlite_thread_indexes(&tx, &columns, scan, target_provider)?;
 
     if columns.contains("model_provider") {
         stats.provider_rows_updated = tx
@@ -1881,7 +2291,8 @@ fn run_native_sync(target_provider: &str) -> Result<String, String> {
         format!("Updated rollout files: {applied_rollouts}"),
         format!(
             "Updated SQLite rows: {}{}",
-            sqlite_stats.provider_rows_updated
+            sqlite_stats.thread_rows_inserted
+                + sqlite_stats.provider_rows_updated
                 + sqlite_stats.user_event_rows_updated
                 + sqlite_stats.cwd_rows_updated,
             if sqlite_present && sqlite_stats.database_present {
@@ -1908,6 +2319,12 @@ fn run_native_sync(target_provider: &str) -> Result<String, String> {
             }
         ),
     ];
+    if sqlite_stats.thread_rows_inserted > 0 {
+        lines.push(format!(
+            "Inserted SQLite thread indexes: {}",
+            sqlite_stats.thread_rows_inserted
+        ));
+    }
     if sqlite_stats.user_event_rows_updated > 0 {
         lines.push(format!(
             "Updated SQLite user-event flags: {}",
@@ -2761,6 +3178,177 @@ fn try_quit_codex() -> Result<QuitCodexResult, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_codex_home(name: &str) -> PathBuf {
+        let path = env::temp_dir().join(format!(
+            "codex-tools-{name}-{}-{}",
+            process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn write_test_rollout(codex_home: &Path, provider: &str) -> PathBuf {
+        let thread_id = "019cbf7c-1db4-7922-a155-d68fff7b82da";
+        let rollout_path = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("03")
+            .join("06")
+            .join(format!("rollout-2026-03-06T03-31-48-{thread_id}.jsonl"));
+        fs::create_dir_all(rollout_path.parent().unwrap()).unwrap();
+        let records = vec![
+            json!({
+                "timestamp": "2026-03-06T03:31:48.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": thread_id,
+                    "timestamp": "2026-03-06T03:31:48.000Z",
+                    "cwd": "/Users/example/project",
+                    "source": "vscode",
+                    "cli_version": "0.137.0-alpha.4",
+                    "model_provider": provider
+                }
+            }),
+            json!({
+                "timestamp": "2026-03-06T03:31:49.000Z",
+                "type": "turn_context",
+                "payload": {
+                    "cwd": "/Users/example/project",
+                    "approval_policy": "never",
+                    "sandbox_policy": {"type": "disabled"},
+                    "model": "gpt-5.3-codex",
+                    "effort": "xhigh"
+                }
+            }),
+            json!({
+                "timestamp": "2026-03-06T03:31:50.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "请同步这个会话"
+                }
+            }),
+        ];
+        let text = records
+            .into_iter()
+            .map(|record| serde_json::to_string(&record).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&rollout_path, text).unwrap();
+        rollout_path
+    }
+
+    fn create_test_threads_db(codex_home: &Path) {
+        let conn = Connection::open(state_db_path(codex_home)).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                rollout_path TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                model_provider TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                title TEXT NOT NULL,
+                sandbox_policy TEXT NOT NULL,
+                approval_mode TEXT NOT NULL,
+                tokens_used INTEGER NOT NULL DEFAULT 0,
+                has_user_event INTEGER NOT NULL DEFAULT 0,
+                archived INTEGER NOT NULL DEFAULT 0,
+                archived_at INTEGER,
+                cli_version TEXT NOT NULL DEFAULT '',
+                first_user_message TEXT NOT NULL DEFAULT '',
+                memory_mode TEXT NOT NULL DEFAULT 'enabled',
+                model TEXT,
+                reasoning_effort TEXT,
+                created_at_ms INTEGER,
+                updated_at_ms INTEGER,
+                thread_source TEXT,
+                preview TEXT NOT NULL DEFAULT ''
+            );
+            "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rollout_scan_collects_index_record_for_restored_session() {
+        let codex_home = temp_codex_home("scan-index");
+        let rollout_path = write_test_rollout(&codex_home, "openai");
+
+        let scan = collect_rollout_scan(&codex_home, Some("simplaj")).unwrap();
+
+        assert_eq!(scan.index_records.len(), 1);
+        assert_eq!(scan.changes.len(), 1);
+        assert_eq!(
+            scan.provider_counts.get("sessions/openai").copied(),
+            Some(1)
+        );
+        let record = &scan.index_records[0];
+        assert_eq!(record.path, rollout_path);
+        assert_eq!(record.thread_id, "019cbf7c-1db4-7922-a155-d68fff7b82da");
+        assert_eq!(record.cwd, "/Users/example/project");
+        assert_eq!(record.source, "vscode");
+        assert_eq!(record.cli_version, "0.137.0-alpha.4");
+        assert_eq!(record.first_user_message, "请同步这个会话");
+        assert_eq!(record.title, "请同步这个会话");
+        assert_eq!(record.model.as_deref(), Some("gpt-5.3-codex"));
+        assert_eq!(record.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(record.approval_mode, "never");
+        assert!(record.has_user_event);
+
+        fs::remove_dir_all(codex_home).unwrap();
+    }
+
+    #[test]
+    fn provider_sync_inserts_missing_sqlite_thread_index() {
+        let codex_home = temp_codex_home("sqlite-index");
+        write_test_rollout(&codex_home, "openai");
+        create_test_threads_db(&codex_home);
+        let scan = collect_rollout_scan(&codex_home, Some("simplaj")).unwrap();
+
+        let stats = update_sqlite_provider(&codex_home, "simplaj", &scan).unwrap();
+
+        assert!(stats.database_present);
+        assert_eq!(stats.thread_rows_inserted, 1);
+        let conn = Connection::open(state_db_path(&codex_home)).unwrap();
+        let row = conn
+            .query_row(
+                "SELECT model_provider, source, cwd, first_user_message, preview, has_user_event, model, reasoning_effort \
+                 FROM threads WHERE id = ?1",
+                params!["019cbf7c-1db4-7922-a155-d68fff7b82da"],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0, "simplaj");
+        assert_eq!(row.1, "vscode");
+        assert_eq!(row.2, "/Users/example/project");
+        assert_eq!(row.3, "请同步这个会话");
+        assert_eq!(row.4, "请同步这个会话");
+        assert_eq!(row.5, 1);
+        assert_eq!(row.6.as_deref(), Some("gpt-5.3-codex"));
+        assert_eq!(row.7.as_deref(), Some("xhigh"));
+
+        let second = update_sqlite_provider(&codex_home, "simplaj", &scan).unwrap();
+        assert_eq!(second.thread_rows_inserted, 0);
+
+        fs::remove_dir_all(codex_home).unwrap();
+    }
 
     #[test]
     fn relay_comment_state_only_toggles_target_provider_relay_lines() {

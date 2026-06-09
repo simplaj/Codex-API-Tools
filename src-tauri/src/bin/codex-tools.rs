@@ -394,11 +394,9 @@ fn cloud_login(args: &[String]) -> Result<(), String> {
         return Err("cloud login requires a non-empty sync key".into());
     }
 
-    let existing_device_token =
-        optional_env("CODEX_TOOLS_DEVICE_TOKEN").or_else(|| existing.device_token.clone());
     let api = ApiClient::new(
         api_url.clone(),
-        existing_device_token,
+        None,
         Some(sync_key.clone()),
         Some(email.clone()),
     )?;
@@ -1168,15 +1166,10 @@ impl ApiClient {
             "syncKeyProof": registration.sync_key_proof.as_deref()
         });
         let response = self.send_with_retries("register", || {
-            let request = self
-                .client
+            self.client
                 .post(self.url("/v1/devices/register"))
                 .header("user-agent", USER_AGENT_VALUE)
-                .json(&payload);
-            match self.device_token.as_deref() {
-                Some(token) => request.bearer_auth(token),
-                None => request,
-            }
+                .json(&payload)
         })?;
         read_json_response(response, "register")
     }

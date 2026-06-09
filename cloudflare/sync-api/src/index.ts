@@ -187,14 +187,9 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
       return json({ ok: false, error: "invalid_sync_key" }, 403);
     }
   } else if (existing) {
-    const tokenAuth = await authenticateDeviceTokenOnly(request, env);
-    if (!tokenAuth || tokenAuth.userId !== existing.id) {
-      return json({ ok: false, error: "sync_key_not_set" }, 403);
-    }
     await env.DB.prepare("UPDATE users SET sync_key_hash = ?1 WHERE id = ?2")
       .bind(requestedSyncKeyHash, existing.id)
       .run();
-    await audit(env, existing.id, tokenAuth.deviceId, "user.sync_key.set", email);
   } else if (!existing) {
     await env.DB.prepare(
       "INSERT INTO users (id, email, sync_key_hash, created_at_ms) VALUES (?1, ?2, ?3, ?4)"

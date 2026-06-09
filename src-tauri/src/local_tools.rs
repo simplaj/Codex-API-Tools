@@ -2384,7 +2384,7 @@ fn parse_quota_payload(
 }
 
 fn quota_recommendation() -> String {
-    "额度恢复后，完全退出 Codex，点击“切回 GPT 订阅”自动注释 base_url 和 experimental_bearer_token；需要中转时点击“恢复中转”。".into()
+    "额度恢复后，可以先完全退出 Codex，再执行 `codex-tools relay gpt` 自动注释 base_url 和 experimental_bearer_token，然后重启 Codex 使用当前 GPT 订阅；需要中转时执行 `codex-tools relay restore` 再重启 Codex。".into()
 }
 
 fn quota_result_unavailable(
@@ -2861,72 +2861,87 @@ requires_openai_auth = true
 
 pub fn inspect_text() -> Result<String, String> {
     let state = inspect()?;
-    let mut lines = vec![
-        format!("Codex home: {}", state.codex_home),
-        format!(
-            "Config: {}{}",
-            state.config_path,
-            if state.config_exists {
-                ""
-            } else {
-                " (missing)"
-            }
-        ),
-        format!(
-            "Auth: {}{}",
-            state.auth_path,
-            if state.auth_exists { "" } else { " (missing)" }
-        ),
-        format!("Backups: {}", state.backup_root),
-        format!("Codex running: {}", state.codex_running),
-    ];
-    if let Some(error) = state.codex_process_detection_error {
-        lines.push(format!("Codex process detection: {error}"));
-    }
-    for process in state.codex_processes.iter().take(8) {
-        lines.push(format!("  pid {}  {}", process.pid, process.command));
-    }
-    if let Some(config) = state.config {
-        lines.push(format!("Root provider: {}", config.root_provider));
-        lines.push("Providers:".into());
-        for provider in config.providers {
+    let mut lines = vec!["Codex 状态".to_string()];
+    match state.codex_process_detection_error.as_deref() {
+        Some(error) => {
+            lines.push("  运行状态：无法确认".into());
+            lines.push("  配置写入：不建议继续，请手动完全退出 Codex 后再操作".into());
+            lines.push(format!("  检测错误：{error}"));
+        }
+        None if state.codex_running => {
             lines.push(format!(
-                "  {} name={} url={} wire_api={} auth={} token={}",
-                provider.id,
-                provider.name,
-                if provider.base_url.is_empty() {
-                    "-"
-                } else {
-                    &provider.base_url
-                },
-                if provider.wire_api.is_empty() {
-                    "-"
-                } else {
-                    &provider.wire_api
-                },
-                if provider.requires_openai_auth.is_empty() {
-                    "-"
-                } else {
-                    &provider.requires_openai_auth
-                },
-                if provider.has_experimental_bearer_token {
-                    provider.experimental_bearer_token_masked
-                } else {
-                    "missing".into()
+                "  运行状态：运行中（检测到 {} 个相关进程）",
+                state.codex_processes.len()
+            ));
+            lines.push(
+                "  配置写入：暂不可写，先执行 `codex-tools codex quit` 或手动完全退出 Codex".into(),
+            );
+        }
+        None => {
+            lines.push("  运行状态：已退出".into());
+            lines.push("  配置写入：可以安全执行 provider/auth/relay 修改".into());
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("本机配置".into());
+    lines.push(format!("  Codex 目录：{}", state.codex_home));
+    lines.push(format!(
+        "  config.toml：{}",
+        if state.config_exists {
+            state.config_path.as_str()
+        } else {
+            "未找到"
+        }
+    ));
+    lines.push(format!(
+        "  auth.json：{}",
+        if state.auth_exists {
+            "已登录/存在"
+        } else {
+            "不存在"
+        }
+    ));
+
+    if let Some(config) = state.config.as_ref() {
+        lines.push(String::new());
+        lines.push("Provider".into());
+        lines.push(format!("  当前 provider：{}", config.root_provider));
+        if let Some(provider) = current_provider(config) {
+            lines.push(format!("  显示名称：{}", provider.name));
+            lines.push(format!(
+                "  中转 URL：{}",
+                configured_label(!provider.base_url.is_empty())
+            ));
+            lines.push(format!(
+                "  中转 Key：{}",
+                configured_label(provider.has_experimental_bearer_token)
+            ));
+            lines.push(format!(
+                "  OpenAI 登录态：{}",
+                match provider.requires_openai_auth.as_str() {
+                    "true" => "需要",
+                    "false" => "不需要",
+                    _ => "未声明",
                 }
             ));
         }
+        if config.providers.len() > 1 {
+            let names = config
+                .providers
+                .iter()
+                .map(|provider| provider.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!("  可用 provider：{names}"));
+        }
     }
-    if !state.provider_choices.is_empty() {
-        lines.push(format!(
-            "Provider choices: {}",
-            state.provider_choices.join(", ")
-        ));
-    }
+
     if !state.backup_dirs.is_empty() {
-        lines.push("Recent backups:".into());
-        for backup in state.backup_dirs {
-            lines.push(format!("  {backup}"));
+        lines.push(String::new());
+        lines.push(format!("最近备份：{}", state.backup_dirs[0]));
+        if state.backup_dirs.len() > 1 {
+            lines.push(format!("  另外还有 {} 个备份", state.backup_dirs.len() - 1));
         }
     }
     Ok(lines.join("\n"))
@@ -3027,67 +3042,299 @@ pub fn quit_codex_text() -> Result<String, String> {
         lines.push(format!("Commands: {}", result.commands.join("; ")));
     }
     if !result.processes.is_empty() {
-        for process in result.processes.iter().take(8) {
-            lines.push(format!("  pid {}  {}", process.pid, process.command));
-        }
+        lines.push(format!(
+            "仍有 {} 个 Codex 相关进程，请手动完全退出后再继续。",
+            result.processes.len()
+        ));
     }
     Ok(lines.join("\n"))
 }
 
-pub fn quota_text(json_output: bool) -> Result<String, String> {
+pub fn quota_text(json_output: bool, raw_json_output: bool) -> Result<String, String> {
     let result = check_openai_quota()?;
-    if json_output {
+    if raw_json_output {
         return serde_json::to_string_pretty(&result).map_err(command_error);
     }
-    let mut lines = vec![
-        format!("Status: {}", result.status),
-        format!("Message: {}", result.message),
-    ];
-    if let Some(email) = result.email_masked {
-        lines.push(format!("Email: {email}"));
+    if json_output {
+        return serde_json::to_string_pretty(&quota_readable_json(&result)).map_err(command_error);
     }
-    if let Some(plan) = result.plan_type {
-        lines.push(format!("Plan: {plan}"));
+    let limit_reached = result
+        .buckets
+        .iter()
+        .any(|bucket| bucket.limit_reached == Some(true));
+    let mut lines = vec!["OpenAI 额度".to_string()];
+    if let Some(email) = result.email_masked.as_deref() {
+        lines.push(format!("  账号：{email}"));
     }
-    if let Some(account) = result.account_id_masked {
-        lines.push(format!("Account: {account}"));
+    if let Some(plan) = result.plan_type.as_deref() {
+        lines.push(format!("  订阅：{plan}"));
     }
-    for bucket in result.buckets {
-        lines.push(format!(
-            "Limit {}{}: allowed={}, reached={}",
-            bucket.limit_id,
-            bucket
-                .limit_name
-                .map(|name| format!(" ({name})"))
-                .unwrap_or_default(),
-            bucket
-                .allowed
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".into()),
-            bucket
-                .limit_reached
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".into())
-        ));
-        for window in [bucket.primary, bucket.secondary].into_iter().flatten() {
+    if let Some(account) = result.account_id_masked.as_deref() {
+        lines.push(format!("  Account：{account}"));
+    }
+
+    lines.push(format!(
+        "  查询结果：{}",
+        if result.ok {
+            if limit_reached {
+                "已触发额度限制"
+            } else {
+                "当前未显示额度限制"
+            }
+        } else {
+            "无法查询"
+        }
+    ));
+    if !result.ok {
+        lines.push(format!("  原因：{}", result.message));
+    } else if let Some(kind) = result.rate_limit_reached_type.as_deref() {
+        lines.push(format!("  限制类型：{kind}"));
+    }
+
+    if !result.buckets.is_empty() {
+        lines.push(String::new());
+        lines.push("额度窗口".into());
+        for bucket in &result.buckets {
             lines.push(format!(
-                "  {}: used={}%, remaining={}%, resets_at={}",
-                window.label,
-                window
-                    .used_percent
-                    .map(|value| format!("{value:.1}"))
-                    .unwrap_or_else(|| "unknown".into()),
-                window
-                    .remaining_percent
-                    .map(|value| format!("{value:.1}"))
-                    .unwrap_or_else(|| "unknown".into()),
-                window
-                    .resets_at
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unknown".into())
+                "  {}：{}",
+                quota_bucket_label(bucket),
+                quota_bucket_state(bucket)
             ));
+            for window in [&bucket.primary, &bucket.secondary].into_iter().flatten() {
+                lines.push(format!("    {}", quota_window_summary(window)));
+            }
         }
     }
+
+    if let Some(spend) = result.spend_control.as_ref() {
+        lines.push(String::new());
+        lines.push("消费限制".into());
+        if let Some(remaining) = spend.remaining.as_deref() {
+            lines.push(format!("  剩余：{remaining}"));
+        }
+        if let Some(used) = spend.used_percent {
+            lines.push(format!("  已用：{used:.1}%"));
+        }
+        if let Some(reset) = reset_summary(spend.reset_after_seconds, spend.resets_at) {
+            lines.push(format!("  恢复：{reset}"));
+        }
+    }
+
+    lines.push(String::new());
     lines.push(result.recommendation);
     Ok(lines.join("\n"))
+}
+
+fn quota_readable_json(result: &OpenAiQuotaResult) -> Value {
+    let limit_reached = result
+        .buckets
+        .iter()
+        .any(|bucket| bucket.limit_reached == Some(true));
+    let query_result = if result.ok {
+        if limit_reached {
+            "已触发额度限制"
+        } else {
+            "当前未显示额度限制"
+        }
+    } else {
+        "无法查询"
+    };
+
+    json!({
+        "title": "OpenAI 额度",
+        "account": {
+            "email": result.email_masked,
+            "subscription": result.plan_type,
+            "accountId": result.account_id_masked,
+            "authMode": result.auth_mode,
+            "lastRefresh": result.last_refresh,
+        },
+        "query": {
+            "ok": result.ok,
+            "status": result.status,
+            "result": query_result,
+            "message": result.message,
+            "limitReachedType": result.rate_limit_reached_type,
+        },
+        "quotaWindows": result
+            .buckets
+            .iter()
+            .map(quota_bucket_readable_json)
+            .collect::<Vec<_>>(),
+        "credits": result.credits.as_ref().map(quota_credits_readable_json),
+        "spendControl": result.spend_control.as_ref().map(spend_control_readable_json),
+        "recommendation": result.recommendation,
+    })
+}
+
+fn quota_bucket_readable_json(bucket: &QuotaBucketView) -> Value {
+    let windows = [&bucket.primary, &bucket.secondary]
+        .into_iter()
+        .flatten()
+        .map(quota_window_readable_json)
+        .collect::<Vec<_>>();
+    json!({
+        "name": quota_bucket_label(bucket),
+        "id": bucket.limit_id,
+        "state": quota_bucket_state(bucket),
+        "allowed": bucket.allowed,
+        "limitReached": bucket.limit_reached,
+        "windows": windows,
+    })
+}
+
+fn quota_window_readable_json(window: &QuotaWindowView) -> Value {
+    let label = match window.label.as_str() {
+        "primary" => "短周期",
+        "secondary" => "长周期",
+        other => other,
+    };
+    json!({
+        "label": label,
+        "summary": quota_window_summary(window),
+        "usedPercent": window.used_percent,
+        "remainingPercent": window.remaining_percent,
+        "windowMinutes": window.window_minutes,
+        "recovery": reset_summary(window.reset_after_seconds, window.resets_at),
+    })
+}
+
+fn quota_credits_readable_json(credits: &QuotaCreditsView) -> Value {
+    let summary = match (
+        credits.unlimited,
+        credits.has_credits,
+        credits.balance.as_deref(),
+    ) {
+        (Some(true), _, _) => "无限额度".to_string(),
+        (_, Some(true), Some(balance)) => format!("有可用余额：{balance}"),
+        (_, Some(true), None) => "有可用余额".to_string(),
+        (_, Some(false), _) => "没有可用余额".to_string(),
+        (_, _, Some(balance)) => format!("余额：{balance}"),
+        _ => "状态未知".to_string(),
+    };
+    json!({
+        "summary": summary,
+        "hasCredits": credits.has_credits,
+        "unlimited": credits.unlimited,
+        "balance": credits.balance,
+    })
+}
+
+fn spend_control_readable_json(spend: &SpendControlView) -> Value {
+    let used = spend
+        .used_percent
+        .map(|value| format!("{value:.1}%"))
+        .unwrap_or_else(|| "未知".into());
+    let remaining = spend
+        .remaining
+        .as_deref()
+        .map(str::to_string)
+        .or_else(|| spend.remaining_percent.map(|value| format!("{value:.1}%")))
+        .unwrap_or_else(|| "未知".into());
+    json!({
+        "summary": format!("已用 {used}，剩余 {remaining}"),
+        "limit": spend.limit,
+        "used": spend.used,
+        "remaining": spend.remaining,
+        "usedPercent": spend.used_percent,
+        "remainingPercent": spend.remaining_percent,
+        "recovery": reset_summary(spend.reset_after_seconds, spend.resets_at),
+    })
+}
+
+fn current_provider(config: &ConfigView) -> Option<&ProviderView> {
+    config.providers.iter().find(|provider| {
+        provider.id == config.root_provider || provider.name == config.root_provider
+    })
+}
+
+fn configured_label(configured: bool) -> &'static str {
+    if configured {
+        "已配置"
+    } else {
+        "未配置"
+    }
+}
+
+fn quota_bucket_label(bucket: &QuotaBucketView) -> String {
+    bucket
+        .limit_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(&bucket.limit_id)
+        .to_string()
+}
+
+fn quota_bucket_state(bucket: &QuotaBucketView) -> &'static str {
+    match (bucket.allowed, bucket.limit_reached) {
+        (_, Some(true)) => "已用尽",
+        (Some(true), _) => "可用",
+        (Some(false), _) => "暂不可用",
+        _ => "状态未知",
+    }
+}
+
+fn quota_window_summary(window: &QuotaWindowView) -> String {
+    let label = match window.label.as_str() {
+        "primary" => "短周期",
+        "secondary" => "长周期",
+        other => other,
+    };
+    let used = window
+        .used_percent
+        .map(|value| format!("{value:.1}%"))
+        .unwrap_or_else(|| "未知".into());
+    let remaining = window
+        .remaining_percent
+        .map(|value| format!("{value:.1}%"))
+        .unwrap_or_else(|| "未知".into());
+    let window_text = window
+        .window_minutes
+        .map(|minutes| format!("，窗口 {}", human_duration(minutes * 60)))
+        .unwrap_or_default();
+    let reset = reset_summary(window.reset_after_seconds, window.resets_at)
+        .map(|value| format!("，恢复：{value}"))
+        .unwrap_or_default();
+    format!("{label}：已用 {used}，剩余 {remaining}{window_text}{reset}")
+}
+
+fn reset_summary(reset_after_seconds: Option<i64>, resets_at: Option<i64>) -> Option<String> {
+    if let Some(seconds) = reset_after_seconds.filter(|value| *value >= 0) {
+        return Some(format!("约 {}后", human_duration(seconds)));
+    }
+    let resets_at = resets_at?;
+    let now_seconds = (unix_millis() / 1000) as i64;
+    if resets_at > now_seconds {
+        Some(format!("约 {}后", human_duration(resets_at - now_seconds)))
+    } else {
+        Some("随时可能恢复".into())
+    }
+}
+
+fn human_duration(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    if seconds < 60 {
+        return "不到 1 分钟".into();
+    }
+    let minutes = (seconds + 59) / 60;
+    if minutes < 60 {
+        return format!("{minutes} 分钟");
+    }
+    let hours = minutes / 60;
+    let remaining_minutes = minutes % 60;
+    if hours < 24 {
+        if remaining_minutes == 0 {
+            format!("{hours} 小时")
+        } else {
+            format!("{hours} 小时 {remaining_minutes} 分钟")
+        }
+    } else {
+        let days = hours / 24;
+        let remaining_hours = hours % 24;
+        if remaining_hours == 0 {
+            format!("{days} 天")
+        } else {
+            format!("{days} 天 {remaining_hours} 小时")
+        }
+    }
 }

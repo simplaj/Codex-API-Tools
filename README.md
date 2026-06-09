@@ -73,9 +73,10 @@ Check the current Codex ChatGPT quota from local `auth.json`:
 ```bash
 codex-tools quota
 codex-tools quota --json
+codex-tools quota --raw-json
 ```
 
-The quota command reads only the local ChatGPT account id, masked email/plan claims, and access token needed for `https://chatgpt.com/backend-api/wham/usage`. Tokens are not printed.
+`quota` prints a short Chinese summary. `quota --json` prints the same user-readable information as structured JSON for scripts or UI integrations. `quota --raw-json` is for debugging the parsed internal fields. The command reads only the local ChatGPT account id, masked email/plan claims, and access token needed for `https://chatgpt.com/backend-api/wham/usage`. Tokens are not printed.
 
 ## Sync Semantics
 
@@ -94,7 +95,9 @@ Cloud sync uses one user-facing secret: the Sync key.
 
 - The CLI compresses and encrypts rollouts locally with zstd + XChaCha20-Poly1305 before upload.
 - The Sync key is saved locally in `~/.codex/codex-api-tools-cloud.json` for simple repeat usage.
-- The Worker receives only a derived `syncKeyProof` during login and stores only a hash of that proof.
+- The Worker receives only a derived `syncKeyProof` and stores only a hash of that proof.
+- Every cloud session API request requires both the per-device Device Token and the Sync-key proof. Knowing only the email address, or only an old Device Token, is not enough to list or download sessions.
+- The Device Token identifies one logged-in machine for audit and future per-device revoke flows. Users normally do not copy or manage it directly; run `codex-tools cloud login` on each machine instead.
 - D1 stores users, devices, session metadata, session versions, and audit events.
 - R2 stores encrypted session blobs only.
 - No `auth.json`, API keys, `config.toml`, ChatGPT tokens, or raw Sync keys are uploaded.
@@ -132,6 +135,15 @@ Large encrypted rollouts are uploaded in chunks automatically. Files up to 50 MB
 
 If the CLI reports a TLS, connection, timeout, or body-stream failure but the Worker dashboard has no matching error, the request likely failed before it reached Cloudflare or before the response reached the client. Retry, or set `HTTP_PROXY` / `HTTPS_PROXY` if the local network needs a proxy.
 
+If `cloud pull` reports `decrypt failed: Sync Key does not match this cloud session`, the encrypted blob downloaded correctly but the local Sync key is not the same key used during upload. Run:
+
+```bash
+codex-tools cloud logout
+codex-tools cloud login --email user@example.com
+```
+
+Then enter the original Sync key and retry `cloud pull`.
+
 After restoring sessions on a machine that uses a different provider name, run:
 
 ```bash
@@ -164,7 +176,7 @@ The Worker uses:
 - Rate limit binding: `REGISTER_RATE_LIMITER`
 - Invite code: `sub2api.simplaj.top`
 
-Registration is protected by invite code + Cloudflare Rate Limiting + Sync-key proof. There is no direct R2 client mode and no operator bypass key path in production.
+Registration is protected by invite code + Cloudflare Rate Limiting + Sync-key proof. Session list/upload/download APIs require Device Token + Sync-key proof on every request. There is no direct R2 client mode and no operator bypass key path in production.
 
 ## Development
 

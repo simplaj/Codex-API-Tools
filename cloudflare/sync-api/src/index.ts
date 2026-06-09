@@ -11,6 +11,11 @@ type AuthContext = {
   deviceId: string;
 };
 
+type DeviceTokenAuth = {
+  userId: string;
+  deviceId: string;
+};
+
 type RateLimitBinding = {
   limit(options: { key: string }): Promise<{ success: boolean }>;
 };
@@ -182,7 +187,14 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
       return json({ ok: false, error: "invalid_sync_key" }, 403);
     }
   } else if (existing) {
-    return json({ ok: false, error: "sync_key_not_set" }, 403);
+    const tokenAuth = await authenticateDeviceTokenOnly(request, env);
+    if (!tokenAuth || tokenAuth.userId !== existing.id) {
+      return json({ ok: false, error: "sync_key_not_set" }, 403);
+    }
+    await env.DB.prepare("UPDATE users SET sync_key_hash = ?1 WHERE id = ?2")
+      .bind(requestedSyncKeyHash, existing.id)
+      .run();
+    await audit(env, existing.id, tokenAuth.deviceId, "user.sync_key.set", email);
   } else if (!existing) {
     await env.DB.prepare(
       "INSERT INTO users (id, email, sync_key_hash, created_at_ms) VALUES (?1, ?2, ?3, ?4)"
@@ -683,9 +695,40 @@ async function handleGetChunkManifest(
 }
 
 async function authenticate(request: Request, env: Env): Promise<AuthContext> {
+  const tokenAuth = await authenticateDeviceTokenOnly(request, env);
+  if (!tokenAuth) {
+    throw new HttpError(401, "invalid_device_token");
+  }
+  const row = await env.DB.prepare(
+    `SELECT email, sync_key_hash, disabled_at_ms
+     FROM users
+     WHERE id = ?1
+     LIMIT 1`
+  ).bind(tokenAuth.userId).first<{ email: string; sync_key_hash: string | null; disabled_at_ms: number | null }>();
+  if (!row || row.disabled_at_ms) {
+    throw new HttpError(403, "user_disabled");
+  }
+  if (!row.sync_key_hash) {
+    throw new HttpError(403, "sync_key_not_set");
+  }
+  const syncKeyProof = normalizeSyncKeyProof(request.headers.get("x-codex-tools-sync-key-proof"));
+  if (!syncKeyProof) {
+    throw new HttpError(401, "missing_sync_key_proof");
+  }
+  const requestedSyncKeyHash = await syncKeyHash(row.email, syncKeyProof);
+  if (!timingSafeEqual(requestedSyncKeyHash, row.sync_key_hash)) {
+    throw new HttpError(403, "invalid_sync_key");
+  }
+  await env.DB.prepare("UPDATE devices SET last_seen_at_ms = ?1 WHERE id = ?2")
+    .bind(Date.now(), tokenAuth.deviceId)
+    .run();
+  return { userId: tokenAuth.userId, deviceId: tokenAuth.deviceId };
+}
+
+async function authenticateDeviceTokenOnly(request: Request, env: Env): Promise<DeviceTokenAuth | null> {
   const token = bearerToken(request);
   if (!token) {
-    throw new HttpError(401, "missing_bearer_token");
+    return null;
   }
   const tokenHash = await sha256Hex(token);
   const row = await env.DB.prepare(
@@ -695,11 +738,8 @@ async function authenticate(request: Request, env: Env): Promise<AuthContext> {
      LIMIT 1`
   ).bind(tokenHash).first<{ id: string; user_id: string }>();
   if (!row) {
-    throw new HttpError(401, "invalid_device_token");
+    return null;
   }
-  await env.DB.prepare("UPDATE devices SET last_seen_at_ms = ?1 WHERE id = ?2")
-    .bind(Date.now(), row.id)
-    .run();
   return { userId: row.user_id, deviceId: row.id };
 }
 
@@ -973,6 +1013,7 @@ function withCors(response: Response): Response {
       "content-type",
       "x-codex-tools-manifest",
       "x-codex-tools-invite-code",
+      "x-codex-tools-sync-key-proof",
       "x-codex-tools-force",
       "x-codex-tools-chunk-sha256",
       "x-codex-tools-chunk-size"

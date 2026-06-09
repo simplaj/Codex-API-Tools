@@ -43,6 +43,7 @@ struct ApiClient {
     api_url: String,
     device_token: Option<String>,
     sync_key: Option<String>,
+    email: Option<String>,
     client: Client,
 }
 
@@ -280,7 +281,10 @@ fn run_relay(args: &[String]) -> Result<(), String> {
 }
 
 fn run_quota(args: &[String]) -> Result<(), String> {
-    println!("{}", local_tools::quota_text(flag(args, "--json"))?);
+    println!(
+        "{}",
+        local_tools::quota_text(flag(args, "--json"), flag(args, "--raw-json"))?
+    );
     Ok(())
 }
 
@@ -390,7 +394,14 @@ fn cloud_login(args: &[String]) -> Result<(), String> {
         return Err("cloud login requires a non-empty sync key".into());
     }
 
-    let api = ApiClient::new(api_url.clone(), None, Some(sync_key.clone()))?;
+    let existing_device_token =
+        optional_env("CODEX_TOOLS_DEVICE_TOKEN").or_else(|| existing.device_token.clone());
+    let api = ApiClient::new(
+        api_url.clone(),
+        existing_device_token,
+        Some(sync_key.clone()),
+        Some(email.clone()),
+    )?;
     let registration = registration_request(
         args,
         email.clone(),
@@ -453,7 +464,8 @@ fn cloud_status() -> Result<(), String> {
     let sync_key = optional_env("CODEX_TOOLS_SYNC_KEY").or_else(|| config.sync_key.clone());
     println!("api: {api_url}");
     println!("config: {}", path.display());
-    println!("email: {}", config.email.as_deref().unwrap_or("not saved"));
+    let email = optional_env("CODEX_TOOLS_EMAIL").or_else(|| config.email.clone());
+    println!("email: {}", email.as_deref().unwrap_or("not saved"));
     println!(
         "device: {}",
         config.device_id.as_deref().unwrap_or("not saved")
@@ -473,7 +485,14 @@ fn cloud_status() -> Result<(), String> {
             "missing"
         }
     );
-    println!("sync key proof: derived locally during login; not saved separately");
+    println!(
+        "auth: {}",
+        if device_token.is_some() && sync_key.is_some() && email.is_some() {
+            "ready (device token + sync key proof)"
+        } else {
+            "incomplete; run `codex-tools cloud login` again"
+        }
+    );
     Ok(())
 }
 
@@ -1074,7 +1093,10 @@ fn decrypt_payload(envelope: &[u8], sync_key: &str) -> Result<Vec<u8>, String> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&derive_key(sync_key)));
     let compressed = cipher
         .decrypt(XNonce::from_slice(&nonce), &envelope[newline + 1..])
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| {
+            "decrypt failed: Sync Key does not match this cloud session. Run `codex-tools cloud logout`, then `codex-tools cloud login --email <email>` with the same Sync Key used when uploading."
+                .to_string()
+        })?;
     let raw =
         zstd::bulk::decompress(&compressed, MAX_DECOMPRESSED_SESSION_BYTES).map_err(to_error)?;
     if sha256_hex(&raw) != header.raw_sha256 {
@@ -1095,6 +1117,7 @@ impl ApiClient {
         api_url: String,
         device_token: Option<String>,
         sync_key: Option<String>,
+        email: Option<String>,
     ) -> Result<Self, String> {
         let timeout_secs = optional_env("CODEX_TOOLS_HTTP_TIMEOUT_SECS")
             .and_then(|value| value.parse::<u64>().ok())
@@ -1111,6 +1134,7 @@ impl ApiClient {
             api_url: api_url.trim_end_matches('/').to_string(),
             device_token,
             sync_key,
+            email,
             client,
         })
     }
@@ -1122,7 +1146,8 @@ impl ApiClient {
             .unwrap_or_else(|| DEFAULT_API_URL.into());
         let device_token = optional_env("CODEX_TOOLS_DEVICE_TOKEN").or(config.device_token);
         let sync_key = optional_env("CODEX_TOOLS_SYNC_KEY").or(config.sync_key);
-        Self::new(api_url, device_token, sync_key)
+        let email = optional_env("CODEX_TOOLS_EMAIL").or(config.email);
+        Self::new(api_url, device_token, sync_key, email)
     }
 
     fn health(&self) -> Result<ApiStatusResponse, String> {
@@ -1143,10 +1168,15 @@ impl ApiClient {
             "syncKeyProof": registration.sync_key_proof.as_deref()
         });
         let response = self.send_with_retries("register", || {
-            self.client
+            let request = self
+                .client
                 .post(self.url("/v1/devices/register"))
                 .header("user-agent", USER_AGENT_VALUE)
-                .json(&payload)
+                .json(&payload);
+            match self.device_token.as_deref() {
+                Some(token) => request.bearer_auth(token),
+                None => request,
+            }
         })?;
         read_json_response(response, "register")
     }
@@ -1192,12 +1222,13 @@ impl ApiClient {
         limit: usize,
         offset: usize,
     ) -> Result<ApiSessionsResponse, String> {
-        let token = self.required_device_token()?.to_string();
+        let (token, sync_key_proof) = self.required_auth_headers()?;
         let limit = limit.clamp(1, MAX_SESSION_LIST_PAGE_SIZE);
         let response = self.send_with_retries("list sessions", || {
             self.client
                 .get(self.url(&format!("/v1/sessions?limit={limit}&offset={offset}")))
                 .header("user-agent", USER_AGENT_VALUE)
+                .header("x-codex-tools-sync-key-proof", sync_key_proof.as_str())
                 .bearer_auth(token.as_str())
         })?;
         read_json_response(response, "list sessions")
@@ -1219,13 +1250,14 @@ impl ApiClient {
             percent_encode_path(&manifest.session_id),
             manifest.raw_sha256
         );
-        let token = self.required_device_token()?.to_string();
+        let (token, sync_key_proof) = self.required_auth_headers()?;
         let response = self.send_with_retries("put version", || {
             self.client
                 .put(self.url(&path))
                 .header("user-agent", USER_AGENT_VALUE)
                 .header("content-type", "application/octet-stream")
                 .header("x-codex-tools-manifest", manifest_header.as_str())
+                .header("x-codex-tools-sync-key-proof", sync_key_proof.as_str())
                 .header("x-codex-tools-force", if force { "true" } else { "false" })
                 .bearer_auth(token.as_str())
                 .body(encrypted.clone())
@@ -1318,7 +1350,7 @@ impl ApiClient {
             manifest.raw_sha256,
             index
         );
-        let token = self.required_device_token()?.to_string();
+        let (token, sync_key_proof) = self.required_auth_headers()?;
         let body = chunk.to_vec();
         let response = self.send_with_retries("put chunk", || {
             self.client
@@ -1326,6 +1358,7 @@ impl ApiClient {
                 .header("user-agent", USER_AGENT_VALUE)
                 .header("content-type", "application/octet-stream")
                 .header("x-codex-tools-manifest", manifest_header.as_str())
+                .header("x-codex-tools-sync-key-proof", sync_key_proof.as_str())
                 .header("x-codex-tools-chunk-sha256", sha256)
                 .header("x-codex-tools-chunk-size", chunk.len().to_string())
                 .bearer_auth(token.as_str())
@@ -1350,13 +1383,14 @@ impl ApiClient {
             percent_encode_path(&manifest.session_id),
             manifest.raw_sha256
         );
-        let token = self.required_device_token()?.to_string();
+        let (token, sync_key_proof) = self.required_auth_headers()?;
         let payload = ChunkCompleteRequest { chunks };
         let response = self.send_with_retries("complete chunked version", || {
             self.client
                 .post(self.url(&path))
                 .header("user-agent", USER_AGENT_VALUE)
                 .header("x-codex-tools-manifest", manifest_header.as_str())
+                .header("x-codex-tools-sync-key-proof", sync_key_proof.as_str())
                 .header("x-codex-tools-force", if force { "true" } else { "false" })
                 .bearer_auth(token.as_str())
                 .json(&payload)
@@ -1386,11 +1420,12 @@ impl ApiClient {
             "/v1/sessions/{}/versions/latest",
             percent_encode_path(session_id)
         );
-        let token = self.required_device_token()?.to_string();
+        let (token, sync_key_proof) = self.required_auth_headers()?;
         self.send_with_retries("latest version", || {
             self.client
                 .get(self.url(&path))
                 .header("user-agent", USER_AGENT_VALUE)
+                .header("x-codex-tools-sync-key-proof", sync_key_proof.as_str())
                 .bearer_auth(token.as_str())
         })
     }
@@ -1401,11 +1436,12 @@ impl ApiClient {
             percent_encode_path(session_id),
             raw_sha256
         );
-        let token = self.required_device_token()?.to_string();
+        let (token, sync_key_proof) = self.required_auth_headers()?;
         let response = self.send_with_retries("get blob", || {
             self.client
                 .get(self.url(&path))
                 .header("user-agent", USER_AGENT_VALUE)
+                .header("x-codex-tools-sync-key-proof", sync_key_proof.as_str())
                 .bearer_auth(token.as_str())
         })?;
         read_success_bytes(response, "get blob")
@@ -1441,11 +1477,12 @@ impl ApiClient {
             percent_encode_path(session_id),
             raw_sha256
         );
-        let token = self.required_device_token()?.to_string();
+        let (token, sync_key_proof) = self.required_auth_headers()?;
         let response = self.send_with_retries("get chunk manifest", || {
             self.client
                 .get(self.url(&path))
                 .header("user-agent", USER_AGENT_VALUE)
+                .header("x-codex-tools-sync-key-proof", sync_key_proof.as_str())
                 .bearer_auth(token.as_str())
         })?;
         let result: ApiChunkManifestResponse = read_json_response(response, "get chunk manifest")?;
@@ -1475,11 +1512,12 @@ impl ApiClient {
             raw_sha256,
             index
         );
-        let token = self.required_device_token()?.to_string();
+        let (token, sync_key_proof) = self.required_auth_headers()?;
         let response = self.send_with_retries("get chunk", || {
             self.client
                 .get(self.url(&path))
                 .header("user-agent", USER_AGENT_VALUE)
+                .header("x-codex-tools-sync-key-proof", sync_key_proof.as_str())
                 .bearer_auth(token.as_str())
         })?;
         read_success_bytes(response, "get chunk")
@@ -1626,6 +1664,19 @@ impl ApiClient {
         self.sync_key
             .as_deref()
             .ok_or_else(|| "missing sync key. Run: codex-tools cloud login".to_string())
+    }
+
+    fn required_email(&self) -> Result<&str, String> {
+        self.email
+            .as_deref()
+            .ok_or_else(|| "missing cloud email. Run: codex-tools cloud login".to_string())
+    }
+
+    fn required_auth_headers(&self) -> Result<(String, String), String> {
+        let token = self.required_device_token()?.to_string();
+        let email = self.required_email()?;
+        let sync_key = self.required_sync_key()?;
+        Ok((token, derive_sync_key_proof(email, sync_key)))
     }
 
     fn url(&self, path: &str) -> String {
@@ -1997,7 +2048,7 @@ Usage:
   codex-tools auth token [--provider NAME] [--key sk-...]
   codex-tools relay gpt [--provider NAME]
   codex-tools relay restore [--provider NAME]
-  codex-tools quota [--json]
+  codex-tools quota [--json|--raw-json]
   codex-tools sessions list [--limit N] [--json] [--codex-home PATH]
   codex-tools cloud login [--email EMAIL] [--api-url URL] [--device NAME] [--key VALUE] [--invite-code CODE]
   codex-tools cloud status
@@ -2013,8 +2064,9 @@ Local config write commands require Codex to be fully closed. Run
 `codex-tools codex quit` first, or close Codex manually if detection fails.
 
 Run `codex-tools cloud login` once to save local cloud sync configuration.
-Environment variables CODEX_TOOLS_API_URL, CODEX_TOOLS_DEVICE_TOKEN, and
-CODEX_TOOLS_SYNC_KEY are optional cloud-sync overrides for automation.
+Environment variables CODEX_TOOLS_API_URL, CODEX_TOOLS_EMAIL,
+CODEX_TOOLS_DEVICE_TOKEN, and CODEX_TOOLS_SYNC_KEY are optional cloud-sync
+overrides for automation.
 CODEX_TOOLS_RELAY_API_KEY can provide the relay API key for `auth token`.
 The sync key is the only user secret: the CLI uses it locally for zstd +
 XChaCha20-Poly1305 encryption/decryption and sends only a derived login proof

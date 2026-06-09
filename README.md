@@ -121,6 +121,7 @@ codex-tools sessions list --json
 codex-tools cloud push --session-id <session-id>
 codex-tools cloud push --all --limit 20
 codex-tools cloud push --all --force
+codex-tools cloud push --all --session-concurrency 4 --chunk-concurrency 8
 
 # List latest cloud versions by session id.
 codex-tools cloud list
@@ -128,6 +129,7 @@ codex-tools cloud list --json
 
 # Restore one session to this machine's CODEX_HOME.
 codex-tools cloud pull --session-id <session-id>
+codex-tools cloud pull --session-id <session-id> --download-concurrency 8
 ```
 
 Check or remove the local login:
@@ -150,13 +152,16 @@ Environment variables are optional overrides for CI or temporary automation:
 - `CODEX_TOOLS_HTTP_CONNECT_TIMEOUT_SECS`
 - `CODEX_TOOLS_CHUNK_SIZE_BYTES`
 - `CODEX_TOOLS_CHUNK_UPLOAD_CONCURRENCY`
+- `CODEX_TOOLS_CHUNK_DOWNLOAD_CONCURRENCY`
 - `CODEX_TOOLS_SESSION_UPLOAD_CONCURRENCY`
 
 `cloud register` is kept for debugging and admin automation, but normal users should use `cloud login`. A correct admin bootstrap token bypasses the invite code and registration rate limit for controlled automation.
 
 `cloud push` is idempotent by default. Before uploading, the CLI checks the latest cloud version for the same session and skips it when the remote `raw_sha256` already matches the local file. The Worker also skips an already stored `session_id + raw_sha256` before reading the upload body, so a retry after a lost response will not re-upload the same blob. Use `--force` only when you intentionally want to bypass the duplicate preflight and rewrite an existing version.
 
-Large encrypted rollouts are uploaded in chunks automatically. Files up to 50 MB encrypted size use a single request; larger encrypted payloads default to 16 MB chunks and are finalized by a chunk manifest in R2. `cloud push --all` processes 2 session groups in parallel by default, and each large session uploads up to 4 chunks in parallel. A session group is one `session_id`; if the same session has multiple local versions, those versions are still uploaded serially from old to new so the latest cloud version stays correct. Tune `CODEX_TOOLS_SESSION_UPLOAD_CONCURRENCY` down when memory is tight or up to 8 for faster machines; tune `CODEX_TOOLS_CHUNK_UPLOAD_CONCURRENCY` down for unstable networks or up to 16 for faster links. Override `CODEX_TOOLS_CHUNK_SIZE_BYTES` only for debugging or constrained networks.
+Large encrypted rollouts are uploaded in chunks automatically. Files up to 50 MB encrypted size use a single request; larger encrypted payloads default to 16 MB chunks and are finalized by a chunk manifest in R2. `cloud push --all` processes 2 session groups in parallel by default, and each large session uploads up to 4 chunks in parallel. A session group is one `session_id`; if the same session has multiple local versions, those versions are still uploaded serially from old to new so the latest cloud version stays correct. Tune per run with `--session-concurrency N` and `--chunk-concurrency N`; aliases `--session-threads N` and `--chunk-threads N` are also accepted. Environment variables `CODEX_TOOLS_SESSION_UPLOAD_CONCURRENCY` and `CODEX_TOOLS_CHUNK_UPLOAD_CONCURRENCY` remain available for automation. Session upload concurrency is capped at 8, and chunk upload concurrency is capped at 16. Override `CODEX_TOOLS_CHUNK_SIZE_BYTES` only for debugging or constrained networks.
+
+Chunked downloads are parallel too when the Worker supports the chunk manifest endpoint. Use `codex-tools cloud pull --session-id <id> --download-concurrency N` or the alias `--download-threads N` to tune a restore; the default is 4 and the cap is 16. `CODEX_TOOLS_CHUNK_DOWNLOAD_CONCURRENCY` is still available for CI or shell-wide defaults. If the Worker endpoint is not deployed yet, the CLI falls back to the older sequential blob download path.
 
 If Codex is still writing an active rollout file, the same session id can produce a new `raw_sha256` on every run. That is treated as a new session version, not a duplicate. Close or pause Codex before a final backup if you want a stable snapshot.
 

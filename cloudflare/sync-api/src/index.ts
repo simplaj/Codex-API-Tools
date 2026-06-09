@@ -116,6 +116,11 @@ export default {
         }
       }
 
+      const chunkManifestMatch = path.match(/^\/v1\/sessions\/([^/]+)\/versions\/([a-f0-9]{64})\/chunks\/manifest$/);
+      if (request.method === "GET" && chunkManifestMatch) {
+        return handleGetChunkManifest(env, auth, decodeSessionId(chunkManifestMatch[1]), chunkManifestMatch[2]);
+      }
+
       const completeMatch = path.match(/^\/v1\/sessions\/([^/]+)\/versions\/([a-f0-9]{64})\/chunks\/complete$/);
       if (request.method === "POST" && completeMatch) {
         return handleCompleteChunkedVersion(
@@ -636,6 +641,45 @@ async function handleGetChunk(
   }));
 }
 
+async function handleGetChunkManifest(
+  env: Env,
+  auth: AuthContext,
+  sessionId: string,
+  rawSha256: string
+): Promise<Response> {
+  validateSessionId(sessionId);
+  const row = await env.DB.prepare(
+    `SELECT * FROM session_versions
+     WHERE user_id = ?1 AND session_id = ?2 AND raw_sha256 = ?3
+     LIMIT 1`
+  ).bind(auth.userId, sessionId, rawSha256).first<Record<string, unknown>>();
+  if (!row) {
+    return json({ ok: false, error: "version_not_found" }, 404);
+  }
+  const blobKey = String(row.blob_key || "");
+  if (!blobKey.startsWith(`${objectPrefix(env)}/${auth.userId}/`)) {
+    return json({ ok: false, error: "invalid_blob_key" }, 500);
+  }
+  if (!blobKey.endsWith(CHUNK_MANIFEST_SUFFIX)) {
+    return json({ ok: false, error: "version_not_chunked" }, 400);
+  }
+  const object = await env.SESSION_BUCKET.get(blobKey);
+  if (!object) {
+    return json({ ok: false, error: "chunk_manifest_not_found" }, 404);
+  }
+  const chunkManifest = JSON.parse(await object.text()) as ChunkedBlobManifest;
+  validateStoredChunkManifest(chunkManifest, sessionId, rawSha256);
+  await audit(env, auth.userId, auth.deviceId, "session.download.chunk_manifest", sessionId);
+  return json({
+    ok: true,
+    chunks: chunkManifest.chunks.map(chunk => ({
+      index: chunk.index,
+      size: chunk.size,
+      sha256: chunk.sha256
+    }))
+  });
+}
+
 async function authenticate(request: Request, env: Env): Promise<AuthContext> {
   const token = bearerToken(request);
   if (!token) {
@@ -723,6 +767,24 @@ function validateStoredChunkManifest(manifest: ChunkedBlobManifest, sessionId: s
     throw new HttpError(500, "invalid_chunk_manifest");
   }
   if (!Array.isArray(manifest.chunks) || manifest.chunks.length <= 0 || manifest.chunks.length > MAX_CHUNK_COUNT) {
+    throw new HttpError(500, "invalid_chunk_manifest");
+  }
+  let totalSize = 0;
+  for (let expectedIndex = 0; expectedIndex < manifest.chunks.length; expectedIndex += 1) {
+    const chunk = manifest.chunks[expectedIndex];
+    if (
+      chunk.index !== expectedIndex
+      || !Number.isSafeInteger(chunk.size)
+      || chunk.size <= 0
+      || !/^[a-f0-9]{64}$/.test(chunk.sha256 || "")
+      || typeof chunk.key !== "string"
+      || chunk.key.length <= 0
+    ) {
+      throw new HttpError(500, "invalid_chunk_manifest");
+    }
+    totalSize += chunk.size;
+  }
+  if (totalSize !== manifest.encryptedSize || !/^[a-f0-9]{64}$/.test(manifest.encryptedSha256 || "")) {
     throw new HttpError(500, "invalid_chunk_manifest");
   }
 }

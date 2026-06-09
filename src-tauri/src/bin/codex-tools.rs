@@ -27,9 +27,12 @@ const MAX_SINGLE_UPLOAD_BYTES: usize = 50 * 1024 * 1024;
 const DEFAULT_CHUNK_SIZE_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_CHUNK_UPLOAD_CONCURRENCY: usize = 4;
 const MAX_CHUNK_UPLOAD_CONCURRENCY: usize = 16;
+const DEFAULT_CHUNK_DOWNLOAD_CONCURRENCY: usize = 4;
+const MAX_CHUNK_DOWNLOAD_CONCURRENCY: usize = 16;
 const DEFAULT_SESSION_UPLOAD_CONCURRENCY: usize = 2;
 const MAX_SESSION_UPLOAD_CONCURRENCY: usize = 8;
 const MAX_DECOMPRESSED_SESSION_BYTES: usize = 512 * 1024 * 1024;
+const CHUNK_MANIFEST_SUFFIX: &str = ".chunks.json";
 
 #[derive(Clone)]
 struct ApiClient {
@@ -143,7 +146,7 @@ struct ApiManifestResponse {
     skipped: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ChunkDescriptor {
     index: usize,
@@ -157,10 +160,25 @@ struct ChunkCompleteRequest {
     chunks: Vec<ChunkDescriptor>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiChunkManifestResponse {
+    ok: bool,
+    error: Option<String>,
+    message: Option<String>,
+    chunks: Option<Vec<ChunkDescriptor>>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum PushSessionOutcome {
     Uploaded,
     Skipped,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UploadOptions {
+    session_concurrency: usize,
+    chunk_concurrency: usize,
 }
 
 fn main() {
@@ -396,6 +414,22 @@ fn cloud_push_api(args: &[String], api: &ApiClient) -> Result<(), String> {
     let force = flag(args, "--force");
     let limit = option_usize(args, "--limit")?;
     let device_name = option_value(args, "--device").unwrap_or_else(default_device_name);
+    let upload_options = UploadOptions {
+        session_concurrency: concurrency_option(
+            args,
+            &["--session-concurrency", "--session-threads"],
+            "CODEX_TOOLS_SESSION_UPLOAD_CONCURRENCY",
+            DEFAULT_SESSION_UPLOAD_CONCURRENCY,
+            MAX_SESSION_UPLOAD_CONCURRENCY,
+        )?,
+        chunk_concurrency: concurrency_option(
+            args,
+            &["--chunk-concurrency", "--chunk-threads"],
+            "CODEX_TOOLS_CHUNK_UPLOAD_CONCURRENCY",
+            DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
+            MAX_CHUNK_UPLOAD_CONCURRENCY,
+        )?,
+    };
 
     if session_filter.is_none() && !all {
         return Err("cloud push requires --all or --session-id <id>".into());
@@ -413,12 +447,7 @@ fn cloud_push_api(args: &[String], api: &ApiClient) -> Result<(), String> {
     }
 
     let session_groups = group_local_sessions_by_id(sessions);
-    let session_concurrency = optional_env("CODEX_TOOLS_SESSION_UPLOAD_CONCURRENCY")
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .map(|value| value.min(MAX_SESSION_UPLOAD_CONCURRENCY))
-        .unwrap_or(DEFAULT_SESSION_UPLOAD_CONCURRENCY)
-        .min(session_groups.len());
+    let session_concurrency = upload_options.session_concurrency.min(session_groups.len());
     println!(
         "session upload concurrency: {} parallel session group(s)",
         session_concurrency
@@ -440,6 +469,7 @@ fn cloud_push_api(args: &[String], api: &ApiClient) -> Result<(), String> {
                 let codex_home = codex_home.clone();
                 let device_name = device_name.clone();
                 let local_seen = Arc::clone(&local_seen);
+                let upload_options = upload_options;
                 handles.push(scope.spawn(move || {
                     push_local_session_group(
                         api,
@@ -449,6 +479,7 @@ fn cloud_push_api(args: &[String], api: &ApiClient) -> Result<(), String> {
                         sessions,
                         force,
                         local_seen,
+                        upload_options,
                     )
                 }));
             }
@@ -502,6 +533,7 @@ fn push_local_session_group(
     sessions: Vec<LocalSessionMeta>,
     force: bool,
     local_seen: Arc<Mutex<HashSet<String>>>,
+    upload_options: UploadOptions,
 ) -> Result<(usize, usize), String> {
     let mut uploaded = 0usize;
     let mut skipped = 0usize;
@@ -518,6 +550,7 @@ fn push_local_session_group(
             force,
             Arc::clone(&local_seen),
             uploaded_at_ms,
+            upload_options,
         )? {
             PushSessionOutcome::Uploaded => uploaded += 1,
             PushSessionOutcome::Skipped => skipped += 1,
@@ -535,6 +568,7 @@ fn push_local_session(
     force: bool,
     local_seen: Arc<Mutex<HashSet<String>>>,
     uploaded_at_ms: u128,
+    upload_options: UploadOptions,
 ) -> Result<PushSessionOutcome, String> {
     let raw_path = codex_home.join(&session.relative_path);
     println!(
@@ -601,7 +635,12 @@ fn push_local_session(
         uploaded_at_ms,
         device_name,
     };
-    let result = api.put_version(&manifest, encrypted, force)?;
+    let result = api.put_version(
+        &manifest,
+        encrypted,
+        force,
+        upload_options.chunk_concurrency,
+    )?;
     if !result.ok {
         return Err(api_error("push", result.error, result.message));
     }
@@ -651,6 +690,13 @@ fn cloud_pull_api(args: &[String], api: &ApiClient) -> Result<(), String> {
         .ok_or_else(|| "cloud pull requires --session-id <id>".to_string())?;
     let force = flag(args, "--force");
     let dry_run = flag(args, "--dry-run");
+    let download_concurrency = concurrency_option(
+        args,
+        &["--download-concurrency", "--download-threads"],
+        "CODEX_TOOLS_CHUNK_DOWNLOAD_CONCURRENCY",
+        DEFAULT_CHUNK_DOWNLOAD_CONCURRENCY,
+        MAX_CHUNK_DOWNLOAD_CONCURRENCY,
+    )?;
 
     let latest = api.latest_version(&session_id)?;
     if !latest.ok {
@@ -659,7 +705,7 @@ fn cloud_pull_api(args: &[String], api: &ApiClient) -> Result<(), String> {
     let manifest = latest
         .manifest
         .ok_or_else(|| format!("no cloud manifest found for session {session_id}"))?;
-    let encrypted = api.get_blob(&manifest.session_id, &manifest.raw_sha256)?;
+    let encrypted = api.get_version_encrypted(&manifest, download_concurrency)?;
     if sha256_hex(&encrypted) != manifest.encrypted_sha256 {
         return Err("downloaded encrypted blob hash does not match manifest".into());
     }
@@ -981,9 +1027,10 @@ impl ApiClient {
         manifest: &SessionManifest,
         encrypted: Vec<u8>,
         force: bool,
+        chunk_concurrency: usize,
     ) -> Result<ApiManifestResponse, String> {
         if encrypted.len() > MAX_SINGLE_UPLOAD_BYTES {
-            return self.put_chunked_version(manifest, encrypted, force);
+            return self.put_chunked_version(manifest, encrypted, force, chunk_concurrency);
         }
         let manifest_header = STANDARD.encode(serde_json::to_vec(manifest).map_err(to_error)?);
         let path = format!(
@@ -1010,17 +1057,16 @@ impl ApiClient {
         manifest: &SessionManifest,
         encrypted: Vec<u8>,
         force: bool,
+        chunk_concurrency: usize,
     ) -> Result<ApiManifestResponse, String> {
         let chunk_size = optional_env("CODEX_TOOLS_CHUNK_SIZE_BYTES")
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0 && *value <= MAX_SINGLE_UPLOAD_BYTES)
             .unwrap_or(DEFAULT_CHUNK_SIZE_BYTES);
         let chunk_count = encrypted.len().div_ceil(chunk_size);
-        let concurrency = optional_env("CODEX_TOOLS_CHUNK_UPLOAD_CONCURRENCY")
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .map(|value| value.min(MAX_CHUNK_UPLOAD_CONCURRENCY))
-            .unwrap_or(DEFAULT_CHUNK_UPLOAD_CONCURRENCY)
+        let concurrency = chunk_concurrency
+            .max(1)
+            .min(MAX_CHUNK_UPLOAD_CONCURRENCY)
             .min(chunk_count);
         println!(
             "chunked upload {}: {} bytes in {} chunk(s) of up to {} bytes, {} parallel upload(s)",
@@ -1182,6 +1228,176 @@ impl ApiClient {
                 .bearer_auth(token.as_str())
         })?;
         read_success_bytes(response, "get blob")
+    }
+
+    fn get_version_encrypted(
+        &self,
+        manifest: &SessionManifest,
+        download_concurrency: usize,
+    ) -> Result<Vec<u8>, String> {
+        if manifest.blob_key.ends_with(CHUNK_MANIFEST_SUFFIX) {
+            match self.get_chunk_manifest(&manifest.session_id, &manifest.raw_sha256) {
+                Ok(chunks) => {
+                    return self.get_chunked_blob(manifest, chunks, download_concurrency);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "chunk manifest unavailable, falling back to sequential blob download: {error}"
+                    );
+                }
+            }
+        }
+        self.get_blob(&manifest.session_id, &manifest.raw_sha256)
+    }
+
+    fn get_chunk_manifest(
+        &self,
+        session_id: &str,
+        raw_sha256: &str,
+    ) -> Result<Vec<ChunkDescriptor>, String> {
+        let path = format!(
+            "/v1/sessions/{}/versions/{}/chunks/manifest",
+            percent_encode_path(session_id),
+            raw_sha256
+        );
+        let token = self.required_device_token()?.to_string();
+        let response = self.send_with_retries("get chunk manifest", || {
+            self.client
+                .get(self.url(&path))
+                .header("user-agent", USER_AGENT_VALUE)
+                .bearer_auth(token.as_str())
+        })?;
+        let result: ApiChunkManifestResponse = read_json_response(response, "get chunk manifest")?;
+        if !result.ok {
+            return Err(api_error(
+                "get chunk manifest",
+                result.error,
+                result.message,
+            ));
+        }
+        let chunks = result
+            .chunks
+            .ok_or_else(|| "get chunk manifest failed: missing chunks".to_string())?;
+        validate_chunk_descriptors(&chunks)?;
+        Ok(chunks)
+    }
+
+    fn get_chunk(
+        &self,
+        session_id: &str,
+        raw_sha256: &str,
+        index: usize,
+    ) -> Result<Vec<u8>, String> {
+        let path = format!(
+            "/v1/sessions/{}/versions/{}/chunks/{}",
+            percent_encode_path(session_id),
+            raw_sha256,
+            index
+        );
+        let token = self.required_device_token()?.to_string();
+        let response = self.send_with_retries("get chunk", || {
+            self.client
+                .get(self.url(&path))
+                .header("user-agent", USER_AGENT_VALUE)
+                .bearer_auth(token.as_str())
+        })?;
+        read_success_bytes(response, "get chunk")
+    }
+
+    fn get_chunked_blob(
+        &self,
+        manifest: &SessionManifest,
+        chunks: Vec<ChunkDescriptor>,
+        download_concurrency: usize,
+    ) -> Result<Vec<u8>, String> {
+        let chunk_count = chunks.len();
+        let expected_size: usize = chunks.iter().map(|chunk| chunk.size).sum();
+        if expected_size != manifest.encrypted_size {
+            return Err(format!(
+                "chunk manifest encrypted size mismatch: expected {}, got {}",
+                manifest.encrypted_size, expected_size
+            ));
+        }
+        let concurrency = download_concurrency
+            .max(1)
+            .min(MAX_CHUNK_DOWNLOAD_CONCURRENCY)
+            .min(chunk_count);
+        println!(
+            "chunked download {}: {} bytes in {} chunk(s), {} parallel download(s)",
+            manifest.session_id, manifest.encrypted_size, chunk_count, concurrency
+        );
+        let mut results = Vec::with_capacity(chunk_count);
+        let mut chunk_iter = chunks.into_iter();
+        loop {
+            let batch: Vec<_> = chunk_iter.by_ref().take(concurrency).collect();
+            if batch.is_empty() {
+                break;
+            }
+            let batch_results = thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(batch.len());
+                for descriptor in batch {
+                    let client = self.clone();
+                    let session_id = manifest.session_id.clone();
+                    let raw_sha256 = manifest.raw_sha256.clone();
+                    handles.push(scope.spawn(move || {
+                        let bytes = client.get_chunk(&session_id, &raw_sha256, descriptor.index)?;
+                        if bytes.len() != descriptor.size {
+                            return Err(format!(
+                                "downloaded chunk {} size mismatch: expected {}, got {}",
+                                descriptor.index,
+                                descriptor.size,
+                                bytes.len()
+                            ));
+                        }
+                        let actual_sha256 = sha256_hex(&bytes);
+                        if actual_sha256 != descriptor.sha256 {
+                            return Err(format!(
+                                "downloaded chunk {} hash mismatch",
+                                descriptor.index
+                            ));
+                        }
+                        Ok::<(usize, Vec<u8>), String>((descriptor.index, bytes))
+                    }));
+                }
+                let mut scoped_results = Vec::with_capacity(handles.len());
+                for handle in handles {
+                    scoped_results.push(
+                        handle
+                            .join()
+                            .unwrap_or_else(|_| Err("chunk download worker panicked".into())),
+                    );
+                }
+                scoped_results
+            });
+            for result in batch_results {
+                let (index, bytes) = result?;
+                println!(
+                    "downloaded chunk {}/{} for {}",
+                    index + 1,
+                    chunk_count,
+                    manifest.session_id
+                );
+                results.push((index, bytes));
+            }
+        }
+        results.sort_by_key(|(index, _)| *index);
+        let mut encrypted = Vec::with_capacity(manifest.encrypted_size);
+        for (expected_index, (index, bytes)) in results.into_iter().enumerate() {
+            if index != expected_index {
+                return Err(format!(
+                    "chunk download result order mismatch at index {expected_index}"
+                ));
+            }
+            encrypted.extend(bytes);
+        }
+        if encrypted.len() != manifest.encrypted_size {
+            return Err(format!(
+                "downloaded encrypted size mismatch: expected {}, got {}",
+                manifest.encrypted_size,
+                encrypted.len()
+            ));
+        }
+        Ok(encrypted)
     }
 
     fn send_with_retries<F>(&self, action: &str, mut build: F) -> Result<Response, String>
@@ -1449,6 +1665,62 @@ fn option_usize(args: &[String], name: &str) -> Result<Option<usize>, String> {
         .transpose()
 }
 
+fn concurrency_option(
+    args: &[String],
+    names: &[&str],
+    env_key: &str,
+    default_value: usize,
+    max_value: usize,
+) -> Result<usize, String> {
+    let value = names
+        .iter()
+        .find_map(|name| option_value(args, name))
+        .or_else(|| optional_env(env_key));
+    let Some(value) = value else {
+        return Ok(default_value);
+    };
+    let parsed = value.parse::<usize>().map_err(|_| {
+        format!(
+            "invalid concurrency value for {} / {}: {}",
+            names.join(", "),
+            env_key,
+            value
+        )
+    })?;
+    if parsed == 0 {
+        return Err(format!(
+            "concurrency value for {} / {} must be greater than 0",
+            names.join(", "),
+            env_key
+        ));
+    }
+    Ok(parsed.min(max_value))
+}
+
+fn validate_chunk_descriptors(chunks: &[ChunkDescriptor]) -> Result<(), String> {
+    if chunks.is_empty() {
+        return Err("chunk manifest is empty".into());
+    }
+    for (expected_index, chunk) in chunks.iter().enumerate() {
+        if chunk.index != expected_index {
+            return Err(format!(
+                "chunk manifest index mismatch: expected {}, got {}",
+                expected_index, chunk.index
+            ));
+        }
+        if chunk.size == 0 {
+            return Err(format!("chunk manifest has empty chunk {}", chunk.index));
+        }
+        if chunk.sha256.len() != 64 || !chunk.sha256.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return Err(format!(
+                "chunk manifest has invalid sha256 for chunk {}",
+                chunk.index
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn flag(args: &[String], name: &str) -> bool {
     args.iter().any(|arg| arg == name)
 }
@@ -1512,16 +1784,18 @@ Usage:
   codex-tools cloud logout
   codex-tools cloud register --email EMAIL [--device NAME] [--platform NAME] [--invite-code CODE]
   codex-tools cloud smoke
-  codex-tools cloud push --all [--limit N] [--device NAME] [--codex-home PATH] [--force]
-  codex-tools cloud push --session-id ID [--device NAME] [--codex-home PATH] [--force]
+  codex-tools cloud push --all [--limit N] [--device NAME] [--codex-home PATH] [--force] [--session-concurrency N] [--chunk-concurrency N]
+  codex-tools cloud push --session-id ID [--device NAME] [--codex-home PATH] [--force] [--chunk-concurrency N]
   codex-tools cloud list [--json]
-  codex-tools cloud pull --session-id ID [--codex-home PATH] [--dry-run] [--force]
+  codex-tools cloud pull --session-id ID [--codex-home PATH] [--dry-run] [--force] [--download-concurrency N]
 
 Run `codex-tools cloud login` once to save local cloud configuration.
 Environment variables CODEX_TOOLS_API_URL, CODEX_TOOLS_DEVICE_TOKEN, and
 CODEX_TOOLS_SYNC_PASSPHRASE are optional overrides for automation.
-Tune upload parallelism with CODEX_TOOLS_SESSION_UPLOAD_CONCURRENCY and
-CODEX_TOOLS_CHUNK_UPLOAD_CONCURRENCY.
+Tune upload parallelism with --session-concurrency/--chunk-concurrency.
+Tune chunked restore parallelism with --download-concurrency.
+Environment fallbacks: CODEX_TOOLS_SESSION_UPLOAD_CONCURRENCY,
+CODEX_TOOLS_CHUNK_UPLOAD_CONCURRENCY, and CODEX_TOOLS_CHUNK_DOWNLOAD_CONCURRENCY.
 New device registration sends invite code sub2api.simplaj.top by default.
 Cloud push skips already uploaded versions by default; use --force to re-upload.
 "#

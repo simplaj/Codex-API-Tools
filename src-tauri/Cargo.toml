@@ -4,9 +4,12 @@ version = "0.1.1"
 description = "Codex API toolbox for provider repair, history sync, and auth-token wiring."
 authors = ["Simplaj"]
 edition = "2021"
+autobins = false
+build = false
 
-[build-dependencies]
-tauri-build = { version = "2", features = [] }
+[[bin]]
+name = "codex-tools"
+path = "src/bin/codex-tools.rs"
 
 [dependencies]
 base64 = "0.22"
@@ -20,5 +23,4 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tauri = { version = "2", features = [] }
 zstd = "0.13"

@@ -112,8 +112,8 @@ case "$os" in
   Darwin)
     platform="macos"
     case "$arch" in
-      arm64|aarch64) asset="codex-tools-macos-aarch64" ;;
-      x86_64|amd64) asset="codex-tools-macos-x64" ;;
+      arm64|aarch64) asset="codex-tools-cli-macos-aarch64" ;;
+      x86_64|amd64) asset="codex-tools-cli-macos-x64" ;;
       *) echo "unsupported macOS architecture: $arch" >&2; exit 1 ;;
     esac
     ;;
@@ -121,7 +121,7 @@ case "$os" in
     case "$arch" in
       x86_64|amd64)
         platform="linux"
-        asset="codex-tools-linux-x64"
+        asset="codex-tools-cli-linux-x64"
         ;;
       *)
         echo "unsupported Linux architecture: $arch" >&2
@@ -149,7 +149,7 @@ cleanup() {
 trap cleanup EXIT
 
 binary_path="$tmp_dir/codex-tools"
-checksum_path="$tmp_dir/$asset.sha256.txt"
+checksum_path="$tmp_dir/codex-tools-cli-checksums.txt"
 
 download() {
   local url="$1"
@@ -178,9 +178,14 @@ sha256_file() {
 
 echo "Downloading $asset for $platform..."
 download "$base_url/$asset" "$binary_path"
-download "$base_url/$asset.sha256.txt" "$checksum_path"
+download "$base_url/codex-tools-cli-checksums.txt" "$checksum_path"
+expected="$(awk -v asset="$asset" '$2 == asset { print $1 }' "$checksum_path")"
 
-expected="$(awk '{print $1}' "$checksum_path")"
+if [[ -z "$expected" ]]; then
+  echo "checksum for $asset was not found" >&2
+  exit 1
+fi
+
 actual="$(sha256_file "$binary_path")"
 if [[ "$expected" != "$actual" ]]; then
   echo "checksum mismatch for $asset" >&2

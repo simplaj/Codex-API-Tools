@@ -1,4 +1,4 @@
-name: Release desktop app
+name: Release CLI
 
 on:
   workflow_dispatch:
@@ -7,57 +7,43 @@ on:
       - main
     tags:
       - "v*"
-      - "app-v*"
       - "codex-api-tools-v*"
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  build-cli:
     name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.platform }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: macOS Apple Silicon
+          - name: macOS Apple Silicon CLI
             platform: macos-latest
             rust-target: aarch64-apple-darwin
-            args: --target aarch64-apple-darwin --bundles dmg
-            artifact-name: macos-aarch64
-            cli-package-name: codex-tools-macos-aarch64
-            cli-binary-path: src-tauri/target/aarch64-apple-darwin/release/codex-tools
-            artifact-paths: |
-              src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
-          - name: macOS Intel
+            package-name: codex-tools-cli-macos-aarch64
+            binary-path: src-tauri/target/aarch64-apple-darwin/release/codex-tools
+          - name: macOS Intel CLI
             platform: macos-latest
             rust-target: x86_64-apple-darwin
-            args: --target x86_64-apple-darwin --bundles dmg
-            artifact-name: macos-x64
-            cli-package-name: codex-tools-macos-x64
-            cli-binary-path: src-tauri/target/x86_64-apple-darwin/release/codex-tools
-            artifact-paths: |
-              src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
-          - name: Windows x64
+            package-name: codex-tools-cli-macos-x64
+            binary-path: src-tauri/target/x86_64-apple-darwin/release/codex-tools
+          - name: Windows x64 CLI
             platform: windows-latest
             rust-target: ""
-            args: --bundles nsis
-            artifact-name: windows-x64
-            cli-package-name: codex-tools-windows-x64
-            cli-binary-path: src-tauri/target/release/codex-tools.exe
-            artifact-paths: |
-              src-tauri/target/release/bundle/nsis/*.exe
+            package-name: codex-tools-cli-windows-x64
+            binary-path: src-tauri/target/release/codex-tools.exe
+          - name: Linux x64 CLI
+            platform: ubuntu-latest
+            rust-target: ""
+            package-name: codex-tools-cli-linux-x64
+            binary-path: src-tauri/target/release/codex-tools
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: lts/*
-          cache: npm
 
       - name: Install Rust stable
         if: matrix.rust-target == ''
@@ -74,16 +60,6 @@ jobs:
         with:
           workspaces: ./src-tauri -> target
 
-      - name: Install frontend dependencies
-        run: npm ci
-
-      - name: Configure macOS ad-hoc signing
-        if: runner.os == 'macOS'
-        run: echo "APPLE_SIGNING_IDENTITY=-" >> "$GITHUB_ENV"
-
-      - name: Build desktop bundle
-        run: npm run tauri -- build ${{ matrix.args }}
-
       - name: Build standalone CLI
         shell: bash
         run: |
@@ -93,97 +69,29 @@ jobs:
           fi
           cargo "${args[@]}"
 
+      - name: Smoke test CLI
+        shell: bash
+        run: '"${{ matrix.binary-path }}" --help'
+
       - name: Package CLI artifact
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          mkdir -p "cli-package/${{ matrix.cli-package-name }}" release-cli
-          cp "${{ matrix.cli-binary-path }}" "cli-package/${{ matrix.cli-package-name }}/codex-tools"
-          chmod +x "cli-package/${{ matrix.cli-package-name }}/codex-tools"
-          cp README.md "cli-package/${{ matrix.cli-package-name }}/README.md"
-          tar -C cli-package -czf "release-cli/${{ matrix.cli-package-name }}.tar.gz" "${{ matrix.cli-package-name }}"
-          shasum -a 256 "release-cli/${{ matrix.cli-package-name }}.tar.gz" > "release-cli/${{ matrix.cli-package-name }}.tar.gz.sha256.txt"
-          cp "${{ matrix.cli-binary-path }}" "release-cli/${{ matrix.cli-package-name }}"
-          chmod +x "release-cli/${{ matrix.cli-package-name }}"
-          shasum -a 256 "release-cli/${{ matrix.cli-package-name }}" > "release-cli/${{ matrix.cli-package-name }}.sha256.txt"
+          mkdir -p release-cli
+          cp "${{ matrix.binary-path }}" "release-cli/${{ matrix.package-name }}"
+          chmod +x "release-cli/${{ matrix.package-name }}"
 
       - name: Package CLI artifact
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path "cli-package/${{ matrix.cli-package-name }}" | Out-Null
           New-Item -ItemType Directory -Force -Path "release-cli" | Out-Null
-          Copy-Item "${{ matrix.cli-binary-path }}" "cli-package/${{ matrix.cli-package-name }}/codex-tools.exe"
-          Copy-Item "README.md" "cli-package/${{ matrix.cli-package-name }}/README.md"
-          Compress-Archive -Path "cli-package/${{ matrix.cli-package-name }}" -DestinationPath "release-cli/${{ matrix.cli-package-name }}.zip" -Force
-          $hash = (Get-FileHash -Algorithm SHA256 "release-cli/${{ matrix.cli-package-name }}.zip").Hash.ToLower()
-          "$hash  ${{ matrix.cli-package-name }}.zip" | Out-File -Encoding ascii "release-cli/${{ matrix.cli-package-name }}.zip.sha256.txt"
-          Copy-Item "${{ matrix.cli-binary-path }}" "release-cli/${{ matrix.cli-package-name }}.exe"
-          $binaryHash = (Get-FileHash -Algorithm SHA256 "release-cli/${{ matrix.cli-package-name }}.exe").Hash.ToLower()
-          "$binaryHash  ${{ matrix.cli-package-name }}.exe" | Out-File -Encoding ascii "release-cli/${{ matrix.cli-package-name }}.exe.sha256.txt"
-
-      - name: Upload desktop artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: desktop-${{ matrix.artifact-name }}
-          path: ${{ matrix.artifact-paths }}
-          if-no-files-found: error
+          Copy-Item "${{ matrix.binary-path }}" "release-cli/${{ matrix.package-name }}.exe"
 
       - name: Upload CLI artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cli-${{ matrix.artifact-name }}
-          path: release-cli/*
-          if-no-files-found: error
-
-  build-linux-cli:
-    name: Build Linux CLI
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libgtk-3-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libssl-dev \
-            libxdo-dev \
-            pkg-config \
-            patchelf
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: ./src-tauri -> target
-
-      - name: Build standalone CLI
-        run: cargo build --manifest-path src-tauri/Cargo.toml --bin codex-tools --release
-
-      - name: Package CLI artifact
-        shell: bash
-        run: |
-          mkdir -p cli-package/codex-tools-linux-x64 release-cli
-          cp src-tauri/target/release/codex-tools cli-package/codex-tools-linux-x64/codex-tools
-          chmod +x cli-package/codex-tools-linux-x64/codex-tools
-          cp README.md cli-package/codex-tools-linux-x64/README.md
-          tar -C cli-package -czf release-cli/codex-tools-linux-x64.tar.gz codex-tools-linux-x64
-          sha256sum release-cli/codex-tools-linux-x64.tar.gz > release-cli/codex-tools-linux-x64.tar.gz.sha256.txt
-          cp src-tauri/target/release/codex-tools release-cli/codex-tools-linux-x64
-          chmod +x release-cli/codex-tools-linux-x64
-          sha256sum release-cli/codex-tools-linux-x64 > release-cli/codex-tools-linux-x64.sha256.txt
-
-      - name: Upload CLI artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cli-linux-x64
+          name: ${{ matrix.package-name }}
           path: release-cli/*
           if-no-files-found: error
 
@@ -191,8 +99,7 @@ jobs:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
     needs:
-      - build
-      - build-linux-cli
+      - build-cli
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -210,11 +117,27 @@ jobs:
           cp scripts/install-codex-tools.ps1 release-assets/installers/install-codex-tools.ps1
           chmod +x release-assets/installers/install-codex-tools.sh
 
+      - name: Create CLI checksum manifest
+        shell: bash
+        run: |
+          checksum_file="release-assets/installers/codex-tools-cli-checksums.txt"
+          : > "${checksum_file}"
+          mapfile -d '' -t cli_files < <(find release-assets -type f -name 'codex-tools-cli-*' -print0 | sort -z)
+          if [[ "${#cli_files[@]}" -eq 0 ]]; then
+            echo "No CLI binaries found" >&2
+            exit 1
+          fi
+          for file in "${cli_files[@]}"; do
+            name="$(basename "${file}")"
+            hash="$(sha256sum "${file}" | awk '{print $1}')"
+            printf '%s  %s\n' "${hash}" "${name}" >> "${checksum_file}"
+          done
+
       - name: Resolve release metadata
         id: meta
         shell: bash
         run: |
-          version="$(node -p "require('./package.json').version")"
+          version="$(awk -F '"' '/^version = / { print $2; exit }' src-tauri/Cargo.toml)"
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             tag="${GITHUB_REF_NAME}"
           else
@@ -236,8 +159,8 @@ jobs:
             exit 1
           fi
 
-          title="Codex API Tools v${RELEASE_VERSION}"
-          notes=$'Download the Windows or macOS desktop installer from the assets below.\n\nCLI one-command install:\nmacOS/Linux: curl -fsSL https://github.com/simplaj/Codex-API-Tools/releases/latest/download/install-codex-tools.sh | bash\nWindows PowerShell: irm https://github.com/simplaj/Codex-API-Tools/releases/latest/download/install-codex-tools.ps1 | iex\n\nThe CLI installer downloads a single platform binary, verifies SHA-256, installs it into the user PATH, and does not require Node.js or npm. Manual tar.gz/zip packages are still provided for offline installs.'
+          title="Codex API Tools CLI v${RELEASE_VERSION}"
+          notes=$'CLI-only release for Codex API Tools.\n\nInstall:\nmacOS/Linux: curl -fsSL https://github.com/simplaj/Codex-API-Tools/releases/latest/download/install-codex-tools.sh | bash\nWindows PowerShell: irm https://github.com/simplaj/Codex-API-Tools/releases/latest/download/install-codex-tools.ps1 | iex\n\nThe installer downloads one platform binary, verifies SHA-256 with codex-tools-cli-checksums.txt, installs it into the user PATH, and does not require Node.js, npm, or Rust. Raw codex-tools-cli-* assets are standalone command-line binaries.'
 
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             gh release upload "${RELEASE_TAG}" "${files[@]}" --clobber

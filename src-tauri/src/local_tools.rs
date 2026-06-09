@@ -1,7 +1,6 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 use base64::{engine::general_purpose::URL_SAFE, engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use filetime::{set_file_mtime, FileTime};
+use reqwest::blocking::Client as BlockingClient;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -12,10 +11,8 @@ use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
-use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{Manager, State};
 
 const APP_BACKUP_NAMESPACE: &str = "gpt-api-tools";
 const DEFAULT_PROVIDER_NAME: &str = "simplaj";
@@ -27,9 +24,6 @@ const SESSION_DIRS: &[&str] = &["sessions", "archived_sessions"];
 const NATIVE_SYNC_ENGINE: &str = "native-rust-rusqlite";
 const CHATGPT_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const RELAY_CONFIG_KEYS: &[&str] = &["base_url", "experimental_bearer_token"];
-
-#[derive(Default)]
-struct TokenCache(Mutex<HashMap<String, String>>);
 
 #[derive(Debug, Clone)]
 struct ProviderSection {
@@ -134,31 +128,6 @@ struct AuthRemoveResult {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TokenCandidate {
-    id: String,
-    backup_path: String,
-    backup_dir: String,
-    masked: String,
-    length: usize,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TokenCandidatesResult {
-    candidates: Vec<TokenCandidate>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ApplyTokenResult {
-    applied: bool,
-    provider_id: String,
-    token_masked: String,
-    backup_dir: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct RelayConfigToggleResult {
     changed: bool,
     provider_id: String,
@@ -166,12 +135,6 @@ struct RelayConfigToggleResult {
     changed_keys: Vec<String>,
     backup_dir: Option<String>,
     message: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OpenPathResult {
-    opened: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -356,31 +319,6 @@ struct WorkspaceRootSyncStats {
     updated: bool,
     updated_workspace_roots: usize,
     saved_workspace_root_count: usize,
-}
-
-fn main() {
-    tauri::Builder::default()
-        .manage(TokenCache::default())
-        .invoke_handler(tauri::generate_handler![
-            inspect,
-            repair_provider,
-            run_provider_sync,
-            backup_remove_auth,
-            list_auth_token_candidates,
-            apply_experimental_token,
-            set_relay_lines_commented,
-            check_openai_quota,
-            try_quit_codex,
-            open_path
-        ])
-        .setup(|app| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.set_title("Codex API Tools");
-            }
-            Ok(())
-        })
-        .run(tauri::generate_context!())
-        .expect("failed to run Codex API Tools");
 }
 
 fn command_error(error: impl ToString) -> String {
@@ -855,7 +793,7 @@ fn sync_backup_file_paths(codex_home: &Path) -> Vec<PathBuf> {
     paths
 }
 
-fn to_desktop_workspace_path(value: &str) -> String {
+fn to_normal_workspace_path(value: &str) -> String {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return value.to_string();
@@ -946,7 +884,7 @@ fn resolve_stored_path(value: &str, cwd_stats: &[ThreadCwdStat]) -> String {
         .filter(|entry| entry.normalized_cwd == comparable)
         .collect();
     if matches.is_empty() {
-        return to_desktop_workspace_path(value);
+        return to_normal_workspace_path(value);
     }
     matches.sort_by(|left, right| {
         right
@@ -955,7 +893,7 @@ fn resolve_stored_path(value: &str, cwd_stats: &[ThreadCwdStat]) -> String {
             .then_with(|| right.updated_at_ms.cmp(&left.updated_at_ms))
             .then_with(|| left.cwd.cmp(&right.cwd))
     });
-    to_desktop_workspace_path(&matches[0].cwd)
+    to_normal_workspace_path(&matches[0].cwd)
 }
 
 fn copy_resolved_object_keys(input: &Value, cwd_stats: &[ThreadCwdStat]) -> Value {
@@ -1119,7 +1057,7 @@ fn collect_rollout_scan(
                 .get("cwd")
                 .and_then(Value::as_str)
                 .filter(|value| !value.trim().is_empty())
-                .map(to_desktop_workspace_path);
+                .map(to_normal_workspace_path);
             if let (Some(thread_id), Some(cwd)) = (thread_id.as_ref(), cwd.as_ref()) {
                 scan.thread_cwd_by_id.insert(thread_id.clone(), cwd.clone());
             }
@@ -1406,7 +1344,7 @@ fn read_workspace_roots_from_global_state(state: &Value) -> Vec<String> {
     dedupe_paths(
         combined
             .into_iter()
-            .map(|path| to_desktop_workspace_path(&path))
+            .map(|path| to_normal_workspace_path(&path))
             .collect(),
     )
 }
@@ -1430,7 +1368,7 @@ fn read_project_thread_visibility(codex_home: &Path) -> Result<Vec<String>, Stri
             .map(|root| {
                 format!(
                     "{}: interactive 0, first page 0/50, ranks (none), exact cwd 0/0, providers (none)",
-                    to_desktop_workspace_path(&root)
+                    to_normal_workspace_path(&root)
                 )
             })
             .collect());
@@ -1493,7 +1431,7 @@ fn read_project_thread_visibility(codex_home: &Path) -> Result<Vec<String>, Stri
         ranked_rows.push((
             index + 1,
             cwd.clone(),
-            to_desktop_workspace_path(&cwd),
+            to_normal_workspace_path(&cwd),
             normalize_comparable_path(&cwd),
             if provider.trim().is_empty() {
                 "(missing)".to_string()
@@ -1507,7 +1445,7 @@ fn read_project_thread_visibility(codex_home: &Path) -> Result<Vec<String>, Stri
         .into_iter()
         .map(|root| {
             let normalized_root = normalize_comparable_path(&root);
-            let exact_root = to_desktop_workspace_path(&root);
+            let exact_root = to_normal_workspace_path(&root);
             let matching_rows: Vec<_> = ranked_rows
                 .iter()
                 .filter(|(_, _, _, normalized_cwd, _)| *normalized_cwd == normalized_root)
@@ -2140,28 +2078,45 @@ fn is_codex_process_command(command: &str) -> bool {
         || lower.contains("codex api tools")
         || lower.contains("codex-api-tools")
         || lower.contains("gpt-api-tools")
+        || lower.contains("codex-tools")
         || lower.contains("codex computer use.app")
         || lower.contains("skycomputeruseclient")
     {
         return false;
     }
 
-    if lower.contains("/applications/codex.app/")
-        || lower.contains("\\codex.app\\")
-        || lower.contains("\\codex\\")
-        || lower.contains("codex.exe")
-    {
+    if lower.contains("/applications/codex.app/") || lower.contains("\\codex.app\\") {
         return true;
     }
 
-    let executable = command.split_whitespace().next().unwrap_or(command);
-    let name = Path::new(executable)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or(executable)
-        .to_ascii_lowercase();
+    let executable = command_executable(command);
+    let name = executable_file_name(executable);
     let name = name.trim_end_matches(".exe");
-    name == "codex" && lower.contains("app-server")
+    name == "codex"
+}
+
+fn command_executable(command: &str) -> &str {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return trimmed;
+    }
+
+    for quote in ['"', '\''] {
+        if let Some(rest) = trimmed.strip_prefix(quote) {
+            return rest.find(quote).map(|end| &rest[..end]).unwrap_or(rest);
+        }
+    }
+
+    trimmed.split_whitespace().next().unwrap_or(trimmed)
+}
+
+fn executable_file_name(executable: &str) -> String {
+    let trimmed = executable.trim().trim_matches('"').trim_matches('\'');
+    trimmed
+        .rsplit(|ch| ch == '/' || ch == '\\')
+        .next()
+        .unwrap_or(trimmed)
+        .to_ascii_lowercase()
 }
 
 fn run_quit_codex_commands() -> Vec<String> {
@@ -2206,37 +2161,6 @@ fn ensure_codex_stopped_for_write(action: &str) -> Result<(), String> {
         processes.len(),
         preview
     ))
-}
-
-fn collect_strings_from_json(value: &Value, output: &mut Vec<String>) {
-    match value {
-        Value::String(value) => output.push(value.clone()),
-        Value::Array(items) => {
-            for item in items {
-                collect_strings_from_json(item, output);
-            }
-        }
-        Value::Object(map) => {
-            for item in map.values() {
-                collect_strings_from_json(item, output);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn extract_sk_tokens(text: &str) -> Vec<String> {
-    let mut tokens = HashSet::new();
-    for segment in text.split(|character: char| {
-        !(character.is_ascii_alphanumeric() || character == '-' || character == '_')
-    }) {
-        if segment.starts_with("sk-") && segment.len() >= 15 {
-            tokens.insert(segment.to_string());
-        }
-    }
-    let mut output: Vec<String> = tokens.into_iter().collect();
-    output.sort();
-    output
 }
 
 fn mask_email(value: &str) -> String {
@@ -2489,8 +2413,7 @@ fn quota_result_unavailable(
     }
 }
 
-#[tauri::command]
-async fn check_openai_quota() -> Result<OpenAiQuotaResult, String> {
+fn check_openai_quota() -> Result<OpenAiQuotaResult, String> {
     let auth = match load_local_chatgpt_auth_for_quota() {
         Ok(auth) => auth,
         Err(error) => return Ok(quota_result_unavailable("unavailable", error, None)),
@@ -2515,11 +2438,11 @@ async fn check_openai_quota() -> Result<OpenAiQuotaResult, String> {
         );
     }
 
-    let client = reqwest::Client::builder()
+    let client = BlockingClient::builder()
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(command_error)?;
-    let response = match client.get(CHATGPT_USAGE_URL).headers(headers).send().await {
+    let response = match client.get(CHATGPT_USAGE_URL).headers(headers).send() {
         Ok(response) => response,
         Err(error) => {
             return Ok(quota_result_unavailable(
@@ -2536,7 +2459,7 @@ async fn check_openai_quota() -> Result<OpenAiQuotaResult, String> {
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let body = response.text().await.unwrap_or_default();
+    let body = response.text().unwrap_or_default();
     if !status.is_success() {
         let preview = body.chars().take(320).collect::<String>();
         return Ok(quota_result_unavailable(
@@ -2588,7 +2511,6 @@ async fn check_openai_quota() -> Result<OpenAiQuotaResult, String> {
     })
 }
 
-#[tauri::command]
 fn inspect() -> Result<InspectState, String> {
     let codex_home = codex_home()?;
     let config_path = config_path()?;
@@ -2628,7 +2550,6 @@ fn inspect() -> Result<InspectState, String> {
     })
 }
 
-#[tauri::command]
 fn run_provider_sync(
     command: Option<String>,
     provider_id: Option<String>,
@@ -2659,7 +2580,6 @@ fn run_provider_sync(
     Ok(native_shell_result(started_at, command_text, outcome))
 }
 
-#[tauri::command]
 fn repair_provider(
     custom_name: Option<String>,
     run_sync: Option<bool>,
@@ -2725,7 +2645,6 @@ fn repair_provider(
     })
 }
 
-#[tauri::command]
 fn backup_remove_auth() -> Result<AuthRemoveResult, String> {
     ensure_codex_stopped_for_write("备份并移除 auth.json")?;
     let auth_path = auth_path()?;
@@ -2747,107 +2666,6 @@ fn backup_remove_auth() -> Result<AuthRemoveResult, String> {
     })
 }
 
-#[tauri::command]
-fn list_auth_token_candidates(cache: State<TokenCache>) -> Result<TokenCandidatesResult, String> {
-    let mut cached = cache.0.lock().map_err(|_| "token cache lock failed")?;
-    cached.clear();
-    let mut candidates = Vec::new();
-
-    for dir in list_backup_dirs_newest_first()? {
-        let auth_backup_path = dir.join("auth.json");
-        if !path_exists(&auth_backup_path) {
-            continue;
-        }
-        let raw = fs::read_to_string(&auth_backup_path).map_err(command_error)?;
-        let mut strings = Vec::new();
-        if let Ok(value) = serde_json::from_str::<Value>(&raw) {
-            collect_strings_from_json(&value, &mut strings);
-        } else {
-            strings.push(raw);
-        }
-        let mut matches = HashSet::new();
-        for item in strings {
-            for token in extract_sk_tokens(&item) {
-                matches.insert(token);
-            }
-        }
-        let mut tokens: Vec<String> = matches.into_iter().collect();
-        tokens.sort();
-        for token in tokens {
-            let id = format!(
-                "{}:{}",
-                dir.file_name()
-                    .map(|name| name.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "backup".into()),
-                candidates.len()
-            );
-            cached.insert(id.clone(), token.clone());
-            candidates.push(TokenCandidate {
-                id,
-                backup_path: path_to_string(&auth_backup_path),
-                backup_dir: path_to_string(&dir),
-                masked: mask_secret(&token),
-                length: token.len(),
-            });
-        }
-    }
-
-    Ok(TokenCandidatesResult { candidates })
-}
-
-#[tauri::command]
-fn apply_experimental_token(
-    provider_id: Option<String>,
-    token: Option<String>,
-    candidate_id: Option<String>,
-    cache: State<TokenCache>,
-) -> Result<ApplyTokenResult, String> {
-    ensure_codex_stopped_for_write("写入 experimental_bearer_token")?;
-    let config_path = config_path()?;
-    let config_text = fs::read_to_string(&config_path).map_err(command_error)?;
-    let target_provider =
-        sanitize_provider_id(provider_id.or_else(|| Some(parse_root_provider(&config_text))))?;
-    let token_to_use = if let Some(candidate_id) = candidate_id {
-        cache
-            .0
-            .lock()
-            .map_err(|_| "token cache lock failed")?
-            .get(&candidate_id)
-            .cloned()
-    } else {
-        token
-    };
-    let token_to_use = token_to_use.ok_or_else(|| "没有可写入的 Simplaj API Key。".to_string())?;
-    if !token_to_use.starts_with("sk-") {
-        return Err("Simplaj API Key 需以 sk- 开头。".into());
-    }
-
-    let mut sections = parse_provider_sections(&config_text);
-    let section_index = sections
-        .iter()
-        .position(|section| section.id == target_provider)
-        .ok_or_else(|| format!("config.toml 中没有找到 [model_providers.{target_provider}]。"))?;
-    let mut section = sections.remove(section_index);
-    let backup = create_backup(&[config_path.clone()], "apply-experimental-bearer-token")?;
-    let mut lines = split_lines(&config_text);
-    upsert_key_in_section(
-        &mut lines,
-        &mut section,
-        "experimental_bearer_token",
-        &format!("\"{}\"", escape_toml_string(&token_to_use)),
-    );
-    upsert_key_in_section(&mut lines, &mut section, "requires_openai_auth", "true");
-    fs::write(&config_path, lines.join("\n")).map_err(command_error)?;
-
-    Ok(ApplyTokenResult {
-        applied: true,
-        provider_id: target_provider,
-        token_masked: mask_secret(&token_to_use),
-        backup_dir: backup.backup_dir,
-    })
-}
-
-#[tauri::command]
 fn set_relay_lines_commented(
     provider_id: Option<String>,
     commented: bool,
@@ -2902,7 +2720,6 @@ fn set_relay_lines_commented(
     })
 }
 
-#[tauri::command]
 fn try_quit_codex() -> Result<QuitCodexResult, String> {
     let before = detect_codex_processes().map_err(|error| {
         format!("无法检测 Codex 是否正在运行。请手动完全关闭 Codex 后再重试。检测错误：{error}")
@@ -2938,28 +2755,6 @@ fn try_quit_codex() -> Result<QuitCodexResult, String> {
         still_running,
         processes,
         message,
-    })
-}
-
-#[tauri::command]
-fn open_path(target_path: Option<String>) -> Result<OpenPathResult, String> {
-    let Some(target_path) = target_path else {
-        return Ok(OpenPathResult { opened: false });
-    };
-    let path = PathBuf::from(target_path);
-    if !path_exists(&path) {
-        return Ok(OpenPathResult { opened: false });
-    }
-    let status = if cfg!(target_os = "macos") {
-        Command::new("open").arg(path).status()
-    } else if cfg!(windows) {
-        Command::new("explorer").arg(path).status()
-    } else {
-        Command::new("xdg-open").arg(path).status()
-    }
-    .map_err(command_error)?;
-    Ok(OpenPathResult {
-        opened: status.success(),
     })
 }
 
@@ -3030,4 +2825,269 @@ requires_openai_auth = true
         assert!(!uncommented.contains("# base_url = \"https://relay.example/v1\""));
         assert!(!uncommented.contains("# experimental_bearer_token = \"sk-relay\""));
     }
+
+    #[test]
+    fn codex_process_detection_matches_real_codex_processes() {
+        assert!(is_codex_process_command(
+            "/Applications/Codex.app/Contents/MacOS/Codex"
+        ));
+        assert!(is_codex_process_command(
+            "/Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled"
+        ));
+        assert!(is_codex_process_command(
+            r#"C:\Users\user\AppData\Local\Programs\Codex\Codex.exe"#
+        ));
+        assert!(is_codex_process_command(
+            r#""C:\Users\user\AppData\Local\Programs\Codex\codex.exe" app-server"#
+        ));
+    }
+
+    #[test]
+    fn codex_process_detection_ignores_this_tool_and_related_helpers() {
+        assert!(!is_codex_process_command(
+            "/Applications/Codex API Tools.app/Contents/MacOS/Codex API Tools"
+        ));
+        assert!(!is_codex_process_command(
+            "/Users/user/.local/bin/codex-tools cloud push --all"
+        ));
+        assert!(!is_codex_process_command(
+            r#"C:\Users\user\AppData\Local\CodexTools\bin\codex-tools.exe cloud status"#
+        ));
+        assert!(!is_codex_process_command(
+            "/Users/user/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService"
+        ));
+    }
+}
+
+pub fn inspect_text() -> Result<String, String> {
+    let state = inspect()?;
+    let mut lines = vec![
+        format!("Codex home: {}", state.codex_home),
+        format!(
+            "Config: {}{}",
+            state.config_path,
+            if state.config_exists {
+                ""
+            } else {
+                " (missing)"
+            }
+        ),
+        format!(
+            "Auth: {}{}",
+            state.auth_path,
+            if state.auth_exists { "" } else { " (missing)" }
+        ),
+        format!("Backups: {}", state.backup_root),
+        format!("Codex running: {}", state.codex_running),
+    ];
+    if let Some(error) = state.codex_process_detection_error {
+        lines.push(format!("Codex process detection: {error}"));
+    }
+    for process in state.codex_processes.iter().take(8) {
+        lines.push(format!("  pid {}  {}", process.pid, process.command));
+    }
+    if let Some(config) = state.config {
+        lines.push(format!("Root provider: {}", config.root_provider));
+        lines.push("Providers:".into());
+        for provider in config.providers {
+            lines.push(format!(
+                "  {} name={} url={} wire_api={} auth={} token={}",
+                provider.id,
+                provider.name,
+                if provider.base_url.is_empty() {
+                    "-"
+                } else {
+                    &provider.base_url
+                },
+                if provider.wire_api.is_empty() {
+                    "-"
+                } else {
+                    &provider.wire_api
+                },
+                if provider.requires_openai_auth.is_empty() {
+                    "-"
+                } else {
+                    &provider.requires_openai_auth
+                },
+                if provider.has_experimental_bearer_token {
+                    provider.experimental_bearer_token_masked
+                } else {
+                    "missing".into()
+                }
+            ));
+        }
+    }
+    if !state.provider_choices.is_empty() {
+        lines.push(format!(
+            "Provider choices: {}",
+            state.provider_choices.join(", ")
+        ));
+    }
+    if !state.backup_dirs.is_empty() {
+        lines.push("Recent backups:".into());
+        for backup in state.backup_dirs {
+            lines.push(format!("  {backup}"));
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+pub fn provider_status_text() -> Result<String, String> {
+    render_native_status()
+}
+
+pub fn provider_sync_text(provider_id: Option<String>) -> Result<String, String> {
+    let target = resolve_sync_target(provider_id);
+    run_native_sync(&target)
+}
+
+pub fn provider_switch_text(provider_id: Option<String>) -> Result<String, String> {
+    let target = resolve_sync_target(provider_id);
+    run_native_switch(&target)
+}
+
+pub fn repair_provider_text(custom_name: Option<String>, run_sync: bool) -> Result<String, String> {
+    let result = repair_provider(custom_name, Some(run_sync))?;
+    let mut lines = vec![result.message];
+    if let Some(backup) = result.backup_dir {
+        lines.push(format!("Backup: {backup}"));
+    }
+    if let Some(sync) = result.sync {
+        if sync.ok {
+            lines.push(sync.stdout);
+        } else {
+            lines.push(format!("Sync failed: {}", sync.stderr));
+        }
+    }
+    Ok(lines
+        .into_iter()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+pub fn backup_remove_auth_text() -> Result<String, String> {
+    let result = backup_remove_auth()?;
+    let mut lines = vec![result.message, format!("Auth path: {}", result.auth_path)];
+    if let Some(backup) = result.backup_dir {
+        lines.push(format!("Backup: {backup}"));
+    }
+    Ok(lines.join("\n"))
+}
+
+pub fn apply_experimental_token_text(
+    provider_id: Option<String>,
+    token: String,
+) -> Result<String, String> {
+    ensure_codex_stopped_for_write("写入 experimental_bearer_token")?;
+    let config_path = config_path()?;
+    let config_text = fs::read_to_string(&config_path).map_err(command_error)?;
+    let target_provider =
+        sanitize_provider_id(provider_id.or_else(|| Some(parse_root_provider(&config_text))))?;
+    if !token.starts_with("sk-") {
+        return Err("API Key 需以 sk- 开头。".into());
+    }
+
+    let mut sections = parse_provider_sections(&config_text);
+    let section_index = sections
+        .iter()
+        .position(|section| section.id == target_provider)
+        .ok_or_else(|| format!("config.toml 中没有找到 [model_providers.{target_provider}]。"))?;
+    let mut section = sections.remove(section_index);
+    let backup = create_backup(&[config_path.clone()], "apply-experimental-bearer-token")?;
+    let mut lines = split_lines(&config_text);
+    upsert_key_in_section(
+        &mut lines,
+        &mut section,
+        "experimental_bearer_token",
+        &format!("\"{}\"", escape_toml_string(&token)),
+    );
+    upsert_key_in_section(&mut lines, &mut section, "requires_openai_auth", "true");
+    fs::write(&config_path, lines.join("\n")).map_err(command_error)?;
+    Ok(format!(
+        "Applied experimental_bearer_token for provider {target_provider}.\nToken: {}\nBackup: {}",
+        mask_secret(&token),
+        backup.backup_dir
+    ))
+}
+
+pub fn relay_toggle_text(provider_id: Option<String>, commented: bool) -> Result<String, String> {
+    let result = set_relay_lines_commented(provider_id, commented)?;
+    let mut lines = vec![result.message];
+    if let Some(backup) = result.backup_dir {
+        lines.push(format!("Backup: {backup}"));
+    }
+    Ok(lines.join("\n"))
+}
+
+pub fn quit_codex_text() -> Result<String, String> {
+    let result = try_quit_codex()?;
+    let mut lines = vec![result.message];
+    if !result.commands.is_empty() {
+        lines.push(format!("Commands: {}", result.commands.join("; ")));
+    }
+    if !result.processes.is_empty() {
+        for process in result.processes.iter().take(8) {
+            lines.push(format!("  pid {}  {}", process.pid, process.command));
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+pub fn quota_text(json_output: bool) -> Result<String, String> {
+    let result = check_openai_quota()?;
+    if json_output {
+        return serde_json::to_string_pretty(&result).map_err(command_error);
+    }
+    let mut lines = vec![
+        format!("Status: {}", result.status),
+        format!("Message: {}", result.message),
+    ];
+    if let Some(email) = result.email_masked {
+        lines.push(format!("Email: {email}"));
+    }
+    if let Some(plan) = result.plan_type {
+        lines.push(format!("Plan: {plan}"));
+    }
+    if let Some(account) = result.account_id_masked {
+        lines.push(format!("Account: {account}"));
+    }
+    for bucket in result.buckets {
+        lines.push(format!(
+            "Limit {}{}: allowed={}, reached={}",
+            bucket.limit_id,
+            bucket
+                .limit_name
+                .map(|name| format!(" ({name})"))
+                .unwrap_or_default(),
+            bucket
+                .allowed
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            bucket
+                .limit_reached
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        ));
+        for window in [bucket.primary, bucket.secondary].into_iter().flatten() {
+            lines.push(format!(
+                "  {}: used={}%, remaining={}%, resets_at={}",
+                window.label,
+                window
+                    .used_percent
+                    .map(|value| format!("{value:.1}"))
+                    .unwrap_or_else(|| "unknown".into()),
+                window
+                    .remaining_percent
+                    .map(|value| format!("{value:.1}"))
+                    .unwrap_or_else(|| "unknown".into()),
+                window
+                    .resets_at
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".into())
+            ));
+        }
+    }
+    lines.push(result.recommendation);
+    Ok(lines.join("\n"))
 }

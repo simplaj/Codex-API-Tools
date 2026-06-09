@@ -2,7 +2,6 @@ export interface Env {
   DB: D1Database;
   SESSION_BUCKET: R2Bucket;
   REGISTER_RATE_LIMITER?: RateLimitBinding;
-  ADMIN_BOOTSTRAP_TOKEN?: string;
   OBJECT_PREFIX?: string;
   REGISTRATION_INVITE_CODE?: string;
 }
@@ -21,6 +20,7 @@ type RegisterBody = {
   deviceName?: string;
   platform?: string;
   inviteCode?: string;
+  syncKeyProof?: string;
 };
 
 type SessionManifest = {
@@ -150,24 +150,17 @@ export default {
 };
 
 async function handleRegister(request: Request, env: Env): Promise<Response> {
-  const expected = env.ADMIN_BOOTSTRAP_TOKEN;
-  const bearer = bearerToken(request);
-  const adminAuthenticated = Boolean(bearer && expected && timingSafeEqual(bearer, expected));
-  if (bearer && !adminAuthenticated) {
-    return json({ ok: false, error: "unauthorized" }, 401);
-  }
-
-  if (!adminAuthenticated) {
-    await enforceRegisterRateLimit(request, env);
-  }
+  await enforceRegisterRateLimit(request, env);
 
   const body = await request.json().catch(() => null) as RegisterBody | null;
   const email = normalizeEmail(body?.email);
   if (!email) {
     return json({ ok: false, error: "email_required" }, 400);
   }
-  if (!adminAuthenticated) {
-    validateInviteCode(env, registerInviteCode(request, body));
+  validateInviteCode(env, registerInviteCode(request, body));
+  const syncKeyProof = normalizeSyncKeyProof(body?.syncKeyProof);
+  if (!syncKeyProof) {
+    return json({ ok: false, error: "sync_key_required" }, 400);
   }
 
   const now = Date.now();
@@ -177,15 +170,23 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
   const tokenHash = await sha256Hex(deviceToken);
   const deviceName = cleanText(body?.deviceName, 120) || "unknown-device";
   const platform = cleanText(body?.platform, 80);
+  const requestedSyncKeyHash = syncKeyProof ? await syncKeyHash(email, syncKeyProof) : null;
 
-  const existing = await env.DB.prepare("SELECT id FROM users WHERE email = ?1")
+  const existing = await env.DB.prepare("SELECT id, sync_key_hash FROM users WHERE email = ?1")
     .bind(email)
-    .first<{ id: string }>();
+    .first<{ id: string; sync_key_hash: string | null }>();
   const finalUserId = existing?.id || userId;
-  if (!existing) {
+
+  if (existing?.sync_key_hash) {
+    if (!requestedSyncKeyHash || !timingSafeEqual(requestedSyncKeyHash, existing.sync_key_hash)) {
+      return json({ ok: false, error: "invalid_sync_key" }, 403);
+    }
+  } else if (existing) {
+    return json({ ok: false, error: "sync_key_not_set" }, 403);
+  } else if (!existing) {
     await env.DB.prepare(
-      "INSERT INTO users (id, email, created_at_ms) VALUES (?1, ?2, ?3)"
-    ).bind(finalUserId, email, now).run();
+      "INSERT INTO users (id, email, sync_key_hash, created_at_ms) VALUES (?1, ?2, ?3, ?4)"
+    ).bind(finalUserId, email, requestedSyncKeyHash, now).run();
   }
 
   await env.DB.prepare(
@@ -232,6 +233,7 @@ async function handleListSessions(
 ): Promise<Response> {
   const url = new URL(request.url);
   const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 100), 1), 500);
+  const offset = Math.max(Number(url.searchParams.get("offset") || 0), 0);
   const rows = await env.DB.prepare(
     `SELECT sv.*
      FROM session_versions sv
@@ -245,8 +247,8 @@ async function handleListSessions(
       AND latest.uploaded_at_ms = sv.uploaded_at_ms
      WHERE sv.user_id = ?1
      ORDER BY sv.uploaded_at_ms DESC
-     LIMIT ?2`
-  ).bind(auth.userId, limit).all<Record<string, unknown>>();
+     LIMIT ?2 OFFSET ?3`
+  ).bind(auth.userId, limit, offset).all<Record<string, unknown>>();
 
   return json({
     ok: true,
@@ -883,6 +885,21 @@ function clientIp(request: Request): string {
 
 function normalizeInviteCode(value: unknown): string {
   return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+function normalizeSyncKeyProof(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const proof = value.trim();
+  if (!/^[a-f0-9]{64}$/.test(proof)) {
+    return null;
+  }
+  return proof;
+}
+
+async function syncKeyHash(email: string, syncKeyProof: string): Promise<string> {
+  return sha256Hex(`codex-tools-sync-login-hash-v1\0${email}\0${syncKeyProof}`);
 }
 
 async function sha256Hex(value: string | ArrayBuffer): Promise<string> {

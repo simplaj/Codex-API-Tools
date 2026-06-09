@@ -15,6 +15,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[path = "../local_tools.rs"]
+mod local_tools;
+
 const SESSION_DIRS: &[&str] = &["sessions", "archived_sessions"];
 const ENVELOPE_FORMAT: &str = "codex-tools-session-v1";
 const USER_AGENT_VALUE: &str = "codex-tools-cloud-sync/0.1.1";
@@ -33,13 +36,13 @@ const DEFAULT_SESSION_UPLOAD_CONCURRENCY: usize = 2;
 const MAX_SESSION_UPLOAD_CONCURRENCY: usize = 8;
 const MAX_DECOMPRESSED_SESSION_BYTES: usize = 512 * 1024 * 1024;
 const CHUNK_MANIFEST_SUFFIX: &str = ".chunks.json";
+const MAX_SESSION_LIST_PAGE_SIZE: usize = 500;
 
 #[derive(Clone)]
 struct ApiClient {
     api_url: String,
     device_token: Option<String>,
-    admin_bootstrap_token: Option<String>,
-    sync_passphrase: Option<String>,
+    sync_key: Option<String>,
     client: Client,
 }
 
@@ -49,6 +52,7 @@ struct RegistrationRequest {
     device_name: String,
     platform: String,
     invite_code: Option<String>,
+    sync_key_proof: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,7 +104,7 @@ struct EncryptedEnvelopeHeader {
 struct CloudConfig {
     api_url: Option<String>,
     device_token: Option<String>,
-    sync_passphrase: Option<String>,
+    sync_key: Option<String>,
     email: Option<String>,
     user_id: Option<String>,
     device_id: Option<String>,
@@ -191,6 +195,12 @@ fn main() {
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("status") => run_local_status(),
+        Some("provider") => run_provider(&args[1..]),
+        Some("auth") => run_auth(&args[1..]),
+        Some("relay") => run_relay(&args[1..]),
+        Some("quota") => run_quota(&args[1..]),
+        Some("codex") => run_codex(&args[1..]),
         Some("sessions") => run_sessions(&args[1..]),
         Some("cloud") => run_cloud(&args[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
@@ -198,6 +208,90 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         Some(other) => Err(format!("unknown command: {other}\n\n{}", help_text())),
+    }
+}
+
+fn run_local_status() -> Result<(), String> {
+    println!("{}", local_tools::inspect_text()?);
+    Ok(())
+}
+
+fn run_provider(args: &[String]) -> Result<(), String> {
+    let output = match args.first().map(String::as_str) {
+        Some("status") | None => local_tools::provider_status_text(),
+        Some("sync") => local_tools::provider_sync_text(option_value(args, "--provider")),
+        Some("switch") => local_tools::provider_switch_text(
+            option_value(args, "--provider").or_else(|| args.get(1).cloned()),
+        ),
+        Some("repair") => local_tools::repair_provider_text(
+            option_value(args, "--name").or_else(|| option_value(args, "--provider")),
+            !flag(args, "--no-sync"),
+        ),
+        Some(other) => Err(format!(
+            "unknown provider command: {other}\n\n{}",
+            help_text()
+        )),
+    }?;
+    println!("{output}");
+    Ok(())
+}
+
+fn run_auth(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("unlock") | Some("remove") | Some("reset") => {
+            println!("{}", local_tools::backup_remove_auth_text()?);
+            println!();
+            println!("Next: restart Codex, sign in with the ChatGPT account that should unlock remote control/plugins, then fully quit Codex before writing the relay key.");
+            println!("Then run: codex-tools auth token --provider <provider>");
+            Ok(())
+        }
+        Some("token") | Some("apply-token") => {
+            let provider = option_value(args, "--provider");
+            let token = option_value(args, "--key")
+                .or_else(|| optional_env("CODEX_TOOLS_RELAY_API_KEY"))
+                .unwrap_or_else(prompt_api_key);
+            println!(
+                "{}",
+                local_tools::apply_experimental_token_text(provider, token)?
+            );
+            println!("Restart Codex for the auth/provider change to take effect.");
+            Ok(())
+        }
+        Some(other) => Err(format!("unknown auth command: {other}\n\n{}", help_text())),
+        None => Err(format!("missing auth command\n\n{}", help_text())),
+    }
+}
+
+fn run_relay(args: &[String]) -> Result<(), String> {
+    let provider = option_value(args, "--provider");
+    let output = match args.first().map(String::as_str) {
+        Some("gpt") | Some("subscription") | Some("off") => {
+            local_tools::relay_toggle_text(provider, true)
+        }
+        Some("relay") | Some("restore") | Some("on") => {
+            local_tools::relay_toggle_text(provider, false)
+        }
+        Some(other) => Err(format!("unknown relay command: {other}\n\n{}", help_text())),
+        None => Err(format!("missing relay command\n\n{}", help_text())),
+    }?;
+    println!("{output}");
+    println!("Restart Codex for the config change to take effect.");
+    Ok(())
+}
+
+fn run_quota(args: &[String]) -> Result<(), String> {
+    println!("{}", local_tools::quota_text(flag(args, "--json"))?);
+    Ok(())
+}
+
+fn run_codex(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("quit") => {
+            println!("{}", local_tools::quit_codex_text()?);
+            Ok(())
+        }
+        Some(other) => Err(format!("unknown codex command: {other}\n\n{}", help_text())),
+        None => Err(format!("missing codex command\n\n{}", help_text())),
     }
 }
 
@@ -242,7 +336,6 @@ fn run_cloud(args: &[String]) -> Result<(), String> {
         Some("login") => cloud_login(args),
         Some("logout") => cloud_logout(),
         Some("status") => cloud_status(),
-        Some("register") => cloud_register(args),
         Some("smoke") => cloud_smoke(),
         Some("push") => cloud_push(args),
         Some("list") => cloud_list(args),
@@ -277,29 +370,6 @@ fn cloud_pull(args: &[String]) -> Result<(), String> {
     cloud_pull_api(args, &api)
 }
 
-fn cloud_register(args: &[String]) -> Result<(), String> {
-    let api = ApiClient::from_config_or_env()?;
-    let email = option_value(args, "--email")
-        .or_else(|| env::var("CODEX_TOOLS_REGISTER_EMAIL").ok())
-        .ok_or_else(|| "cloud register requires --email <email>".to_string())?;
-    let device_name = option_value(args, "--device").unwrap_or_else(default_device_name);
-    let platform = option_value(args, "--platform").unwrap_or_else(default_platform);
-    let registration = registration_request(args, email, device_name, platform);
-    let result = api.register(&registration)?;
-    if !result.ok {
-        return Err(api_error("register", result.error, result.message));
-    }
-    let user_id = result.user_id.unwrap_or_else(|| "-".into());
-    let device_id = result.device_id.unwrap_or_else(|| "-".into());
-    let token = result
-        .device_token
-        .ok_or_else(|| "register response missing deviceToken".to_string())?;
-    println!("registered user: {user_id}");
-    println!("registered device: {device_id}");
-    println!("CODEX_TOOLS_DEVICE_TOKEN={token}");
-    Ok(())
-}
-
 fn cloud_login(args: &[String]) -> Result<(), String> {
     let existing = load_cloud_config()?.unwrap_or_default();
     let api_url = option_value(args, "--api-url")
@@ -313,20 +383,21 @@ fn cloud_login(args: &[String]) -> Result<(), String> {
         .ok_or_else(|| "cloud login requires an email".to_string())?;
     let device_name = option_value(args, "--device").unwrap_or_else(default_device_name);
     let platform = option_value(args, "--platform").unwrap_or_else(default_platform);
-    let sync_passphrase = option_value(args, "--passphrase")
-        .or_else(|| optional_env("CODEX_TOOLS_SYNC_PASSPHRASE"))
-        .unwrap_or_else(|| prompt_sync_passphrase());
-    if sync_passphrase.trim().is_empty() {
-        return Err("cloud login requires a non-empty sync passphrase".into());
+    let sync_key = option_value(args, "--key")
+        .or_else(|| optional_env("CODEX_TOOLS_SYNC_KEY"))
+        .unwrap_or_else(|| prompt_sync_key());
+    if sync_key.trim().is_empty() {
+        return Err("cloud login requires a non-empty sync key".into());
     }
 
-    let api = ApiClient::new(
-        api_url.clone(),
-        None,
-        optional_env("CODEX_TOOLS_ADMIN_BOOTSTRAP_TOKEN"),
-        Some(sync_passphrase.clone()),
-    )?;
-    let registration = registration_request(args, email.clone(), device_name.clone(), platform);
+    let api = ApiClient::new(api_url.clone(), None, Some(sync_key.clone()))?;
+    let registration = registration_request(
+        args,
+        email.clone(),
+        device_name.clone(),
+        platform,
+        Some(derive_sync_key_proof(&email, &sync_key)),
+    );
     let result = api.register(&registration)?;
     if !result.ok {
         return Err(api_error("login", result.error, result.message));
@@ -343,7 +414,7 @@ fn cloud_login(args: &[String]) -> Result<(), String> {
     let config = CloudConfig {
         api_url: Some(api_url.clone()),
         device_token: Some(device_token),
-        sync_passphrase: Some(sync_passphrase),
+        sync_key: Some(sync_key),
         email: Some(email),
         user_id: Some(user_id.clone()),
         device_id: Some(device_id.clone()),
@@ -379,8 +450,7 @@ fn cloud_status() -> Result<(), String> {
         .unwrap_or_else(|| DEFAULT_API_URL.into());
     let device_token =
         optional_env("CODEX_TOOLS_DEVICE_TOKEN").or_else(|| config.device_token.clone());
-    let sync_passphrase =
-        optional_env("CODEX_TOOLS_SYNC_PASSPHRASE").or_else(|| config.sync_passphrase.clone());
+    let sync_key = optional_env("CODEX_TOOLS_SYNC_KEY").or_else(|| config.sync_key.clone());
     println!("api: {api_url}");
     println!("config: {}", path.display());
     println!("email: {}", config.email.as_deref().unwrap_or("not saved"));
@@ -396,18 +466,19 @@ fn cloud_status() -> Result<(), String> {
             .unwrap_or_else(|| "missing".into())
     );
     println!(
-        "sync passphrase: {}",
-        if sync_passphrase.is_some() {
+        "sync key: {}",
+        if sync_key.is_some() {
             "saved"
         } else {
             "missing"
         }
     );
+    println!("sync key proof: derived locally during login; not saved separately");
     Ok(())
 }
 
 fn cloud_push_api(args: &[String], api: &ApiClient) -> Result<(), String> {
-    let passphrase = api.required_sync_passphrase()?;
+    let sync_key = api.required_sync_key()?;
     let codex_home = option_path(args, "--codex-home")?.unwrap_or(codex_home()?);
     let session_filter = option_value(args, "--session-id");
     let all = flag(args, "--all");
@@ -467,7 +538,7 @@ fn cloud_push_api(args: &[String], api: &ApiClient) -> Result<(), String> {
             let mut handles = Vec::with_capacity(batch.len());
             for sessions in batch {
                 let api = api.clone();
-                let passphrase = passphrase.to_string();
+                let sync_key = sync_key.to_string();
                 let codex_home = codex_home.clone();
                 let device_name = device_name.clone();
                 let local_seen = Arc::clone(&local_seen);
@@ -475,7 +546,7 @@ fn cloud_push_api(args: &[String], api: &ApiClient) -> Result<(), String> {
                 handles.push(scope.spawn(move || {
                     push_local_session_group(
                         api,
-                        passphrase,
+                        sync_key,
                         codex_home,
                         device_name,
                         sessions,
@@ -529,7 +600,7 @@ fn group_local_sessions_by_id(sessions: Vec<LocalSessionMeta>) -> Vec<Vec<LocalS
 
 fn push_local_session_group(
     api: ApiClient,
-    passphrase: String,
+    sync_key: String,
     codex_home: PathBuf,
     device_name: String,
     sessions: Vec<LocalSessionMeta>,
@@ -545,7 +616,7 @@ fn push_local_session_group(
         last_uploaded_at_ms = uploaded_at_ms;
         match push_local_session(
             api.clone(),
-            passphrase.clone(),
+            sync_key.clone(),
             codex_home.clone(),
             device_name.clone(),
             session,
@@ -563,7 +634,7 @@ fn push_local_session_group(
 
 fn push_local_session(
     api: ApiClient,
-    passphrase: String,
+    sync_key: String,
     codex_home: PathBuf,
     device_name: String,
     session: LocalSessionMeta,
@@ -613,7 +684,7 @@ fn push_local_session(
         }
     }
 
-    let encrypted = encrypt_payload(&raw, &passphrase)?;
+    let encrypted = encrypt_payload(&raw, &sync_key)?;
     let encrypted_sha256 = sha256_hex(&encrypted);
     println!(
         "uploading {}: raw {}, encrypted {} bytes",
@@ -672,26 +743,48 @@ fn cloud_list_api(args: &[String], api: &ApiClient) -> Result<(), String> {
         );
         return Ok(());
     }
-    println!("cloud session versions: {}", manifests.len());
-    for manifest in latest_manifests(manifests) {
+    let latest = latest_manifests(manifests);
+    println!("cloud sessions: {} latest version(s)", latest.len());
+    for manifest in latest {
+        println!("{}", manifest.session_id);
         println!(
-            "{}  {}  {}  {}",
-            manifest.session_id,
+            "  provider/model: {}/{}",
             manifest.provider_name.as_deref().unwrap_or("-"),
-            manifest.model.as_deref().unwrap_or("-"),
-            manifest.relative_path
+            manifest.model.as_deref().unwrap_or("-")
+        );
+        if let Some(title) = manifest.title.as_deref() {
+            println!("  title: {title}");
+        }
+        if let Some(cwd) = manifest.cwd.as_deref() {
+            println!("  cwd: {cwd}");
+        }
+        println!("  path: {}", manifest.relative_path);
+        println!(
+            "  raw/encrypted: {} / {} bytes",
+            short_hash(&manifest.raw_sha256),
+            manifest.encrypted_size
+        );
+        println!("  uploaded_at_ms: {}", manifest.uploaded_at_ms);
+        println!(
+            "  pull: codex-tools cloud pull --session-id {}",
+            manifest.session_id
         );
     }
+    println!("Use `codex-tools cloud pull --all` to restore every listed latest session.");
     Ok(())
 }
 
 fn cloud_pull_api(args: &[String], api: &ApiClient) -> Result<(), String> {
-    let passphrase = api.required_sync_passphrase()?;
+    let sync_key = api.required_sync_key()?;
     let codex_home = option_path(args, "--codex-home")?.unwrap_or(codex_home()?);
-    let session_id = option_value(args, "--session-id")
-        .ok_or_else(|| "cloud pull requires --session-id <id>".to_string())?;
+    let session_id = option_value(args, "--session-id");
+    let all = flag(args, "--all");
+    if all == session_id.is_some() {
+        return Err("cloud pull requires exactly one of --all or --session-id <id>".into());
+    }
     let force = flag(args, "--force");
     let dry_run = flag(args, "--dry-run");
+    let total_limit = option_usize(args, "--limit")?;
     let download_concurrency = concurrency_option(
         args,
         &["--download-concurrency", "--download-threads"],
@@ -701,41 +794,97 @@ fn cloud_pull_api(args: &[String], api: &ApiClient) -> Result<(), String> {
         MAX_CHUNK_DOWNLOAD_CONCURRENCY,
     )?;
 
-    let latest = api.latest_version(&session_id)?;
-    if !latest.ok {
-        return Err(api_error("latest", latest.error, latest.message));
+    let manifests = if all {
+        latest_manifests(api.list_all_sessions(total_limit)?)
+    } else {
+        let session_id = session_id.expect("validated above");
+        let latest = api.latest_version(&session_id)?;
+        if !latest.ok {
+            return Err(api_error("latest", latest.error, latest.message));
+        }
+        vec![latest
+            .manifest
+            .ok_or_else(|| format!("no cloud manifest found for session {session_id}"))?]
+    };
+    if manifests.is_empty() {
+        println!("no cloud sessions matched");
+        return Ok(());
     }
-    let manifest = latest
-        .manifest
-        .ok_or_else(|| format!("no cloud manifest found for session {session_id}"))?;
+
+    let mut restored = 0usize;
+    let mut skipped = 0usize;
+    let mut planned = 0usize;
+    for manifest in manifests {
+        match restore_cloud_manifest(
+            api,
+            sync_key,
+            &codex_home,
+            &manifest,
+            force,
+            dry_run,
+            download_concurrency,
+        )? {
+            RestoreOutcome::Restored => restored += 1,
+            RestoreOutcome::Skipped => skipped += 1,
+            RestoreOutcome::DryRun => planned += 1,
+        }
+    }
+    if dry_run {
+        println!("cloud pull dry run ok: planned {planned}, skipped {skipped}");
+    } else {
+        println!("cloud pull ok: restored {restored}, skipped {skipped}");
+    }
+    println!(
+        "run provider metadata sync after restore if this machine uses a different provider name"
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreOutcome {
+    Restored,
+    Skipped,
+    DryRun,
+}
+
+fn restore_cloud_manifest(
+    api: &ApiClient,
+    sync_key: &str,
+    codex_home: &Path,
+    manifest: &SessionManifest,
+    force: bool,
+    dry_run: bool,
+    download_concurrency: usize,
+) -> Result<RestoreOutcome, String> {
+    let target_path = codex_home.join(&manifest.relative_path);
+    if target_path.exists() && !force {
+        let existing = fs::read(&target_path).map_err(to_error)?;
+        if sha256_hex(&existing) == manifest.raw_sha256 {
+            println!("already restored: {}", target_path.display());
+            return Ok(RestoreOutcome::Skipped);
+        }
+        return Err(format!(
+            "{} already exists with different content. Use --force to overwrite.",
+            target_path.display()
+        ));
+    }
+
     let encrypted = api.get_version_encrypted(&manifest, download_concurrency)?;
     if sha256_hex(&encrypted) != manifest.encrypted_sha256 {
         return Err("downloaded encrypted blob hash does not match manifest".into());
     }
-    let raw = decrypt_payload(&encrypted, &passphrase)?;
+    let raw = decrypt_payload(&encrypted, sync_key)?;
     if sha256_hex(&raw) != manifest.raw_sha256 {
         return Err("decrypted rollout hash does not match manifest".into());
     }
 
-    let target_path = codex_home.join(&manifest.relative_path);
     if dry_run {
         println!(
             "dry run: would restore {} bytes to {}",
             raw.len(),
             target_path.display()
         );
-        return Ok(());
-    }
-    if target_path.exists() && !force {
-        let existing = fs::read(&target_path).map_err(to_error)?;
-        if sha256_hex(&existing) == manifest.raw_sha256 {
-            println!("already restored: {}", target_path.display());
-            return Ok(());
-        }
-        return Err(format!(
-            "{} already exists with different content. Use --force to overwrite.",
-            target_path.display()
-        ));
+        return Ok(RestoreOutcome::DryRun);
     }
     if let Some(parent) = target_path.parent() {
         fs::create_dir_all(parent).map_err(to_error)?;
@@ -747,9 +896,10 @@ fn cloud_pull_api(args: &[String], api: &ApiClient) -> Result<(), String> {
         target_path.display()
     );
     println!(
-        "run provider metadata sync after restore if this machine uses a different provider name"
+        "verified local decrypt/decompress: raw {}",
+        short_hash(&manifest.raw_sha256)
     );
-    Ok(())
+    Ok(RestoreOutcome::Restored)
 }
 
 fn latest_manifests(manifests: Vec<SessionManifest>) -> Vec<SessionManifest> {
@@ -882,11 +1032,11 @@ fn list_rollout_files(root: &Path, output: &mut Vec<PathBuf>) -> Result<(), Stri
     Ok(())
 }
 
-fn encrypt_payload(raw: &[u8], passphrase: &str) -> Result<Vec<u8>, String> {
+fn encrypt_payload(raw: &[u8], sync_key: &str) -> Result<Vec<u8>, String> {
     let compressed = zstd::bulk::compress(raw, 3).map_err(to_error)?;
     let mut nonce = [0u8; 24];
     OsRng.fill_bytes(&mut nonce);
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(&derive_key(passphrase)));
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&derive_key(sync_key)));
     let ciphertext = cipher
         .encrypt(XNonce::from_slice(&nonce), compressed.as_ref())
         .map_err(|error| error.to_string())?;
@@ -904,7 +1054,7 @@ fn encrypt_payload(raw: &[u8], passphrase: &str) -> Result<Vec<u8>, String> {
     Ok(output)
 }
 
-fn decrypt_payload(envelope: &[u8], passphrase: &str) -> Result<Vec<u8>, String> {
+fn decrypt_payload(envelope: &[u8], sync_key: &str) -> Result<Vec<u8>, String> {
     let newline = envelope
         .iter()
         .position(|byte| *byte == b'\n')
@@ -921,7 +1071,7 @@ fn decrypt_payload(envelope: &[u8], passphrase: &str) -> Result<Vec<u8>, String>
     if nonce.len() != 24 {
         return Err("encrypted payload nonce has invalid length".into());
     }
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(&derive_key(passphrase)));
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&derive_key(sync_key)));
     let compressed = cipher
         .decrypt(XNonce::from_slice(&nonce), &envelope[newline + 1..])
         .map_err(|error| error.to_string())?;
@@ -933,10 +1083,10 @@ fn decrypt_payload(envelope: &[u8], passphrase: &str) -> Result<Vec<u8>, String>
     Ok(raw)
 }
 
-fn derive_key(passphrase: &str) -> [u8; 32] {
+fn derive_key(sync_key: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"codex-tools-sync-key-v1\0");
-    hasher.update(passphrase.as_bytes());
+    hasher.update(sync_key.as_bytes());
     hasher.finalize().into()
 }
 
@@ -944,8 +1094,7 @@ impl ApiClient {
     fn new(
         api_url: String,
         device_token: Option<String>,
-        admin_bootstrap_token: Option<String>,
-        sync_passphrase: Option<String>,
+        sync_key: Option<String>,
     ) -> Result<Self, String> {
         let timeout_secs = optional_env("CODEX_TOOLS_HTTP_TIMEOUT_SECS")
             .and_then(|value| value.parse::<u64>().ok())
@@ -961,8 +1110,7 @@ impl ApiClient {
         Ok(Self {
             api_url: api_url.trim_end_matches('/').to_string(),
             device_token,
-            admin_bootstrap_token,
-            sync_passphrase,
+            sync_key,
             client,
         })
     }
@@ -973,15 +1121,8 @@ impl ApiClient {
             .or(config.api_url)
             .unwrap_or_else(|| DEFAULT_API_URL.into());
         let device_token = optional_env("CODEX_TOOLS_DEVICE_TOKEN").or(config.device_token);
-        let admin_bootstrap_token = optional_env("CODEX_TOOLS_ADMIN_BOOTSTRAP_TOKEN");
-        let sync_passphrase =
-            optional_env("CODEX_TOOLS_SYNC_PASSPHRASE").or(config.sync_passphrase);
-        Self::new(
-            api_url,
-            device_token,
-            admin_bootstrap_token,
-            sync_passphrase,
-        )
+        let sync_key = optional_env("CODEX_TOOLS_SYNC_KEY").or(config.sync_key);
+        Self::new(api_url, device_token, sync_key)
     }
 
     fn health(&self) -> Result<ApiStatusResponse, String> {
@@ -998,27 +1139,64 @@ impl ApiClient {
             "email": registration.email.as_str(),
             "deviceName": registration.device_name.as_str(),
             "platform": registration.platform.as_str(),
-            "inviteCode": registration.invite_code.as_deref()
+            "inviteCode": registration.invite_code.as_deref(),
+            "syncKeyProof": registration.sync_key_proof.as_deref()
         });
         let response = self.send_with_retries("register", || {
-            let mut request = self
-                .client
+            self.client
                 .post(self.url("/v1/devices/register"))
                 .header("user-agent", USER_AGENT_VALUE)
-                .json(&payload);
-            if let Some(token) = self.admin_bootstrap_token.as_ref() {
-                request = request.bearer_auth(token);
-            }
-            request
+                .json(&payload)
         })?;
         read_json_response(response, "register")
     }
 
     fn list_sessions(&self, limit: usize) -> Result<ApiSessionsResponse, String> {
+        self.list_sessions_page(limit, 0)
+    }
+
+    fn list_all_sessions(
+        &self,
+        total_limit: Option<usize>,
+    ) -> Result<Vec<SessionManifest>, String> {
+        if total_limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        let mut sessions = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let remaining = total_limit
+                .map(|limit| limit.saturating_sub(sessions.len()))
+                .unwrap_or(MAX_SESSION_LIST_PAGE_SIZE);
+            if remaining == 0 {
+                break;
+            }
+            let page_size = remaining.min(MAX_SESSION_LIST_PAGE_SIZE);
+            let result = self.list_sessions_page(page_size, offset)?;
+            if !result.ok {
+                return Err(api_error("list", result.error, result.message));
+            }
+            let page = result.sessions.unwrap_or_default();
+            let page_len = page.len();
+            sessions.extend(page);
+            if page_len < page_size {
+                break;
+            }
+            offset += page_len;
+        }
+        Ok(sessions)
+    }
+
+    fn list_sessions_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<ApiSessionsResponse, String> {
         let token = self.required_device_token()?.to_string();
+        let limit = limit.clamp(1, MAX_SESSION_LIST_PAGE_SIZE);
         let response = self.send_with_retries("list sessions", || {
             self.client
-                .get(self.url(&format!("/v1/sessions?limit={limit}")))
+                .get(self.url(&format!("/v1/sessions?limit={limit}&offset={offset}")))
                 .header("user-agent", USER_AGENT_VALUE)
                 .bearer_auth(token.as_str())
         })?;
@@ -1444,10 +1622,10 @@ impl ApiClient {
             .ok_or_else(|| "not logged in. Run: codex-tools cloud login".to_string())
     }
 
-    fn required_sync_passphrase(&self) -> Result<&str, String> {
-        self.sync_passphrase
+    fn required_sync_key(&self) -> Result<&str, String> {
+        self.sync_key
             .as_deref()
-            .ok_or_else(|| "missing sync passphrase. Run: codex-tools cloud login".to_string())
+            .ok_or_else(|| "missing sync key. Run: codex-tools cloud login".to_string())
     }
 
     fn url(&self, path: &str) -> String {
@@ -1518,6 +1696,10 @@ fn network_error_message(error: reqwest::Error) -> String {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+fn short_hash(value: &str) -> String {
+    value.chars().take(12).collect()
 }
 
 fn relative_path(root: &Path, path: &Path) -> Result<String, String> {
@@ -1610,23 +1792,36 @@ fn prompt_required(prompt: &str) -> Result<String, String> {
     Ok(value)
 }
 
-fn prompt_sync_passphrase() -> String {
-    let first = match rpassword::prompt_password("Sync passphrase: ") {
+fn prompt_sync_key() -> String {
+    let first = match rpassword::prompt_password("Sync key: ") {
         Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
-        _ => prompt_required("Sync passphrase: ").unwrap_or_default(),
+        _ => prompt_required("Sync key: ").unwrap_or_default(),
     };
     if first.is_empty() {
         return first;
     }
-    let second = match rpassword::prompt_password("Confirm sync passphrase: ") {
+    let second = match rpassword::prompt_password("Confirm sync key: ") {
         Ok(value) => value.trim().to_string(),
         Err(_) => first.clone(),
     };
     if first != second {
-        eprintln!("sync passphrase confirmation mismatch");
+        eprintln!("sync key confirmation mismatch");
         return String::new();
     }
     first
+}
+
+fn prompt_api_key() -> String {
+    match rpassword::prompt_password("API key: ") {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => prompt_required("API key: ").unwrap_or_default(),
+    }
+}
+
+fn derive_sync_key_proof(email: &str, sync_key: &str) -> String {
+    let normalized_email = email.trim().to_lowercase();
+    let material = format!("codex-tools-sync-login-proof-v1\0{normalized_email}\0{sync_key}");
+    sha256_hex(material.as_bytes())
 }
 
 fn registration_request(
@@ -1634,6 +1829,7 @@ fn registration_request(
     email: String,
     device_name: String,
     platform: String,
+    sync_key_proof: Option<String>,
 ) -> RegistrationRequest {
     RegistrationRequest {
         email,
@@ -1642,6 +1838,7 @@ fn registration_request(
         invite_code: option_value(args, "--invite-code")
             .or_else(|| optional_env("CODEX_TOOLS_INVITE_CODE"))
             .or_else(|| Some(DEFAULT_INVITE_CODE.into())),
+        sync_key_proof,
     }
 }
 
@@ -1790,20 +1987,38 @@ fn help_text() -> String {
     r#"Codex API Tools CLI
 
 Usage:
+  codex-tools status
+  codex-tools codex quit
+  codex-tools provider status
+  codex-tools provider repair [--name simplaj] [--no-sync]
+  codex-tools provider sync [--provider NAME]
+  codex-tools provider switch NAME
+  codex-tools auth unlock
+  codex-tools auth token [--provider NAME] [--key sk-...]
+  codex-tools relay gpt [--provider NAME]
+  codex-tools relay restore [--provider NAME]
+  codex-tools quota [--json]
   codex-tools sessions list [--limit N] [--json] [--codex-home PATH]
-  codex-tools cloud login [--email EMAIL] [--api-url URL] [--device NAME] [--passphrase VALUE] [--invite-code CODE]
+  codex-tools cloud login [--email EMAIL] [--api-url URL] [--device NAME] [--key VALUE] [--invite-code CODE]
   codex-tools cloud status
   codex-tools cloud logout
-  codex-tools cloud register --email EMAIL [--device NAME] [--platform NAME] [--invite-code CODE]
   codex-tools cloud smoke
   codex-tools cloud push --all [--limit N] [--device NAME] [--codex-home PATH] [--force] [-n N]
   codex-tools cloud push --session-id ID [--device NAME] [--codex-home PATH] [--force] [-n N]
-  codex-tools cloud list [--json]
+  codex-tools cloud list [--limit N] [--json]
+  codex-tools cloud pull --all [--limit N] [--codex-home PATH] [--dry-run] [--force] [-n N]
   codex-tools cloud pull --session-id ID [--codex-home PATH] [--dry-run] [--force] [-n N]
 
-Run `codex-tools cloud login` once to save local cloud configuration.
+Local config write commands require Codex to be fully closed. Run
+`codex-tools codex quit` first, or close Codex manually if detection fails.
+
+Run `codex-tools cloud login` once to save local cloud sync configuration.
 Environment variables CODEX_TOOLS_API_URL, CODEX_TOOLS_DEVICE_TOKEN, and
-CODEX_TOOLS_SYNC_PASSPHRASE are optional overrides for automation.
+CODEX_TOOLS_SYNC_KEY are optional cloud-sync overrides for automation.
+CODEX_TOOLS_RELAY_API_KEY can provide the relay API key for `auth token`.
+The sync key is the only user secret: the CLI uses it locally for zstd +
+XChaCha20-Poly1305 encryption/decryption and sends only a derived login proof
+to the Worker when registering a device.
 Tune transfer parallelism with -n N. On push, -n applies to session upload
 groups and chunk uploads. On pull, -n applies to chunk downloads.
 Advanced aliases remain available: --threads, --session-concurrency,

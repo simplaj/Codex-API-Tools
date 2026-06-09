@@ -13,9 +13,38 @@ permissions:
   contents: write
 
 jobs:
+  test-cli:
+    name: Test CLI and Worker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Run CLI tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --bin codex-tools --locked
+
+      - name: Check CLI build
+        run: cargo check --manifest-path src-tauri/Cargo.toml --bin codex-tools --locked
+
+      - name: Validate Worker bundle
+        run: npx --yes wrangler deploy --dry-run --config cloudflare/sync-api/wrangler.jsonc
+
   build-cli:
     name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.platform }}
+    needs:
+      - test-cli
     strategy:
       fail-fast: false
       matrix:

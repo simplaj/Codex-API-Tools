@@ -2079,6 +2079,12 @@ Cloud push skips already uploaded versions by default; use --force to re-upload.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn encryption_round_trip_preserves_payload() {
@@ -2159,6 +2165,177 @@ mod tests {
         assert_eq!(value, 3);
     }
 
+    #[test]
+    fn cloud_login_push_list_pull_full_flow_uses_auth_and_local_encryption() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let codex_home = TempDir::new("cloud-full-flow");
+        let _codex_home_env = EnvVarGuard::set("CODEX_HOME", codex_home.path());
+        let server = MockApiServer::start();
+        let email = "test@example.com";
+        let sync_key = "test-sync-key";
+        let session_id = "019e96a2-f017-7841-aeb3-8e9a90c7f7f2";
+        let session_path =
+            "sessions/2026/06/10/rollout-2026-06-10T00-00-00-019e96a2-f017-7841-aeb3-8e9a90c7f7f2.jsonl";
+        let raw = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"title\":\"Full flow\",\"cwd\":\"/tmp/project\",\"model_provider\":\"simplaj\",\"model\":\"gpt-5\"}}}}\n{{\"type\":\"turn_context\",\"payload\":{{\"note\":\"hello\"}}}}\n"
+        );
+        write_file(&codex_home.path().join(session_path), raw.as_bytes());
+
+        let login_args = strings(&[
+            "login",
+            "--email",
+            email,
+            "--api-url",
+            server.base_url(),
+            "--device",
+            "test-device",
+            "--platform",
+            "test-os",
+            "--key",
+            sync_key,
+        ]);
+        cloud_login(&login_args).unwrap();
+
+        let saved = load_cloud_config().unwrap().unwrap();
+        assert_eq!(saved.api_url.as_deref(), Some(server.base_url()));
+        assert_eq!(saved.device_token.as_deref(), Some("mock-device-token"));
+        assert_eq!(saved.sync_key.as_deref(), Some(sync_key));
+        assert_eq!(saved.email.as_deref(), Some(email));
+        assert_eq!(saved.user_id.as_deref(), Some("mock-user"));
+        assert_eq!(saved.device_id.as_deref(), Some("mock-device"));
+
+        let api = ApiClient::from_config_or_env().unwrap();
+        let push_args = strings(&[
+            "push",
+            "--all",
+            "--codex-home",
+            codex_home.path_str(),
+            "-n",
+            "2",
+        ]);
+        cloud_push_api(&push_args, &api).unwrap();
+        assert_eq!(server.version_count(session_id), 1);
+        assert_eq!(server.put_version_count(), 1);
+
+        let stored = server.latest(session_id).unwrap();
+        assert_ne!(stored.encrypted, raw.as_bytes());
+        assert_eq!(
+            decrypt_payload(&stored.encrypted, sync_key).unwrap(),
+            raw.as_bytes()
+        );
+        assert_eq!(stored.manifest.provider_name.as_deref(), Some("simplaj"));
+        assert_eq!(stored.manifest.model.as_deref(), Some("gpt-5"));
+
+        cloud_push_api(&push_args, &api).unwrap();
+        assert_eq!(server.version_count(session_id), 1);
+        assert_eq!(server.put_version_count(), 1);
+
+        cloud_list_api(&strings(&["list", "--limit", "20"]), &api).unwrap();
+
+        fs::remove_file(codex_home.path().join(session_path)).unwrap();
+        let pull_args = strings(&[
+            "pull",
+            "--session-id",
+            session_id,
+            "--codex-home",
+            codex_home.path_str(),
+            "--force",
+        ]);
+        cloud_pull_api(&pull_args, &api).unwrap();
+        let restored = fs::read(codex_home.path().join(session_path)).unwrap();
+        assert_eq!(restored, raw.as_bytes());
+
+        let wrong_key_api = ApiClient::new(
+            server.base_url().to_string(),
+            Some("mock-device-token".into()),
+            Some("wrong-sync-key".into()),
+            Some(email.into()),
+        )
+        .unwrap();
+        fs::remove_file(codex_home.path().join(session_path)).unwrap();
+        let error = cloud_pull_api(&pull_args, &wrong_key_api).unwrap_err();
+        assert!(error.contains("403 Forbidden"), "{error}");
+
+        let latest = api
+            .latest_version(session_id)
+            .unwrap()
+            .manifest
+            .expect("mock latest manifest");
+        let error = restore_cloud_manifest(
+            &api,
+            "wrong-sync-key",
+            codex_home.path(),
+            &latest,
+            true,
+            false,
+            4,
+        )
+        .unwrap_err();
+        assert!(error.contains("Sync Key does not match"), "{error}");
+
+        assert!(server
+            .request_logs()
+            .iter()
+            .any(|request| request.method == "GET"
+                && request.path.starts_with("/v1/sessions")
+                && request.authorization.as_deref() == Some("Bearer mock-device-token")
+                && request.sync_key_proof.as_deref()
+                    == Some(derive_sync_key_proof(email, sync_key).as_str())));
+    }
+
+    #[test]
+    fn cloud_api_rejects_missing_and_wrong_sync_key_auth() {
+        let server = MockApiServer::start();
+        let email = "auth@example.com";
+        let sync_key = "correct-sync-key";
+        let proof = derive_sync_key_proof(email, sync_key);
+        let registration = RegistrationRequest {
+            email: email.into(),
+            device_name: "auth-device".into(),
+            platform: "test-os".into(),
+            invite_code: Some(DEFAULT_INVITE_CODE.into()),
+            sync_key_proof: Some(proof),
+        };
+        let anonymous = ApiClient::new(server.base_url().to_string(), None, None, None).unwrap();
+        anonymous.register(&registration).unwrap();
+
+        let missing = result_error(
+            ApiClient::new(
+                server.base_url().to_string(),
+                None,
+                Some(sync_key.into()),
+                Some(email.into()),
+            )
+            .unwrap()
+            .list_sessions(10),
+        );
+        assert!(missing.contains("not logged in"), "{missing}");
+
+        let wrong_token = result_error(
+            ApiClient::new(
+                server.base_url().to_string(),
+                Some("wrong-token".into()),
+                Some(sync_key.into()),
+                Some(email.into()),
+            )
+            .unwrap()
+            .list_sessions(10),
+        );
+        assert!(wrong_token.contains("401 Unauthorized"), "{wrong_token}");
+
+        let wrong_key = result_error(
+            ApiClient::new(
+                server.base_url().to_string(),
+                Some("mock-device-token".into()),
+                Some("wrong-key".into()),
+                Some(email.into()),
+            )
+            .unwrap()
+            .list_sessions(10),
+        );
+        assert!(wrong_key.contains("403 Forbidden"), "{wrong_key}");
+    }
+
     fn test_local_session(
         session_id: &str,
         relative_path: &str,
@@ -2175,5 +2352,521 @@ mod tests {
             modified_at_ms,
             size: 1,
         }
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn result_error<T>(result: Result<T, String>) -> String {
+        match result {
+            Ok(_) => panic!("expected error"),
+            Err(error) => error,
+        }
+    }
+
+    fn write_file(path: &Path, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn restore_env(key: &str, old_value: Option<std::ffi::OsString>) {
+        if let Some(value) = old_value {
+            env::set_var(key, value);
+        } else {
+            env::remove_var(key);
+        }
+    }
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let unique = format!(
+                "codex-tools-test-{name}-{}-{}",
+                std::process::id(),
+                unix_millis()
+            );
+            let path = env::temp_dir().join(unique);
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn path_str(&self) -> &str {
+            self.path.to_str().unwrap()
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    struct EnvVarGuard {
+        key: String,
+        old_value: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &str, value: &Path) -> Self {
+            let old_value = env::var_os(key);
+            env::set_var(key, value);
+            Self {
+                key: key.into(),
+                old_value,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            restore_env(&self.key, self.old_value.clone());
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockStoredVersion {
+        manifest: SessionManifest,
+        encrypted: Vec<u8>,
+    }
+
+    #[derive(Clone)]
+    struct MockRequestLog {
+        method: String,
+        path: String,
+        authorization: Option<String>,
+        sync_key_proof: Option<String>,
+    }
+
+    #[derive(Default)]
+    struct MockApiState {
+        email: Option<String>,
+        sync_key_proof: Option<String>,
+        device_token: Option<String>,
+        versions: HashMap<String, Vec<MockStoredVersion>>,
+        requests: Vec<MockRequestLog>,
+        put_versions: usize,
+    }
+
+    struct MockApiServer {
+        base_url: String,
+        state: Arc<Mutex<MockApiState>>,
+        stop: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl MockApiServer {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let state = Arc::new(Mutex::new(MockApiState::default()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_state = Arc::clone(&state);
+            let thread_stop = Arc::clone(&stop);
+            let handle = thread::spawn(move || {
+                while !thread_stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => handle_mock_connection(stream, &thread_state),
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                base_url,
+                state,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        fn base_url(&self) -> &str {
+            &self.base_url
+        }
+
+        fn version_count(&self, session_id: &str) -> usize {
+            self.state
+                .lock()
+                .unwrap()
+                .versions
+                .get(session_id)
+                .map(Vec::len)
+                .unwrap_or(0)
+        }
+
+        fn put_version_count(&self) -> usize {
+            self.state.lock().unwrap().put_versions
+        }
+
+        fn latest(&self, session_id: &str) -> Option<MockStoredVersion> {
+            self.state
+                .lock()
+                .unwrap()
+                .versions
+                .get(session_id)
+                .and_then(|versions| {
+                    versions
+                        .iter()
+                        .max_by_key(|version| version.manifest.uploaded_at_ms)
+                        .cloned()
+                })
+        }
+
+        fn request_logs(&self) -> Vec<MockRequestLog> {
+            self.state.lock().unwrap().requests.clone()
+        }
+    }
+
+    impl Drop for MockApiServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect(self.base_url.trim_start_matches("http://"));
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    struct MockHttpRequest {
+        method: String,
+        path: String,
+        headers: HashMap<String, String>,
+        body: Vec<u8>,
+    }
+
+    fn handle_mock_connection(mut stream: TcpStream, state: &Arc<Mutex<MockApiState>>) {
+        let Some(request) = read_mock_request(&mut stream) else {
+            return;
+        };
+        let response = route_mock_request(request, state);
+        let _ = stream.write_all(&response);
+    }
+
+    fn read_mock_request(stream: &mut TcpStream) -> Option<MockHttpRequest> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut buffer = Vec::new();
+        let mut temp = [0u8; 4096];
+        loop {
+            let read = stream.read(&mut temp).ok()?;
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&temp[..read]);
+            if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+            if Instant::now() > deadline {
+                return None;
+            }
+        }
+        let header_end = buffer.windows(4).position(|window| window == b"\r\n\r\n")? + 4;
+        let header_text = String::from_utf8_lossy(&buffer[..header_end]);
+        let mut lines = header_text.lines();
+        let request_line = lines.next()?;
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next()?.to_string();
+        let path = parts.next()?.to_string();
+        let mut headers = HashMap::new();
+        for line in lines {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+            }
+        }
+        let content_length = headers
+            .get("content-length")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = buffer[header_end..].to_vec();
+        while body.len() < content_length {
+            let read = stream.read(&mut temp).ok()?;
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&temp[..read]);
+        }
+        body.truncate(content_length);
+        Some(MockHttpRequest {
+            method,
+            path,
+            headers,
+            body,
+        })
+    }
+
+    fn route_mock_request(request: MockHttpRequest, state: &Arc<Mutex<MockApiState>>) -> Vec<u8> {
+        {
+            let mut state = state.lock().unwrap();
+            state.requests.push(MockRequestLog {
+                method: request.method.clone(),
+                path: request.path.clone(),
+                authorization: request.headers.get("authorization").cloned(),
+                sync_key_proof: request.headers.get("x-codex-tools-sync-key-proof").cloned(),
+            });
+        }
+
+        let path_only = request.path.split('?').next().unwrap_or(&request.path);
+        if request.method == "GET" && path_only == "/v1/health" {
+            return json_response(200, json!({ "ok": true }));
+        }
+        if request.method == "POST" && path_only == "/v1/devices/register" {
+            return mock_register(request, state);
+        }
+
+        if let Err(response) = mock_auth(&request, state) {
+            return response;
+        }
+
+        if request.method == "GET" && path_only == "/v1/sessions" {
+            return mock_list_sessions(state);
+        }
+        if request.method == "PUT" {
+            if let Some((session_id, raw_sha256)) = parse_version_path(path_only) {
+                return mock_put_version(request, state, &session_id, &raw_sha256);
+            }
+        }
+        if request.method == "GET" {
+            if let Some(session_id) = parse_latest_path(path_only) {
+                return mock_latest_version(state, &session_id);
+            }
+            if let Some((session_id, raw_sha256)) = parse_blob_path(path_only) {
+                return mock_get_blob(state, &session_id, &raw_sha256);
+            }
+        }
+        json_response(404, json!({ "ok": false, "error": "not_found" }))
+    }
+
+    fn mock_register(request: MockHttpRequest, state: &Arc<Mutex<MockApiState>>) -> Vec<u8> {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            body.get("inviteCode").and_then(Value::as_str),
+            Some(DEFAULT_INVITE_CODE)
+        );
+        let email = body
+            .get("email")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let sync_key_proof = body
+            .get("syncKeyProof")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let mut state = state.lock().unwrap();
+        state.email = Some(email);
+        state.sync_key_proof = Some(sync_key_proof);
+        state.device_token = Some("mock-device-token".into());
+        json_response(
+            200,
+            json!({
+                "ok": true,
+                "userId": "mock-user",
+                "deviceId": "mock-device",
+                "deviceToken": "mock-device-token"
+            }),
+        )
+    }
+
+    fn mock_auth(
+        request: &MockHttpRequest,
+        state: &Arc<Mutex<MockApiState>>,
+    ) -> Result<(), Vec<u8>> {
+        let state = state.lock().unwrap();
+        let expected_token = state.device_token.as_deref().unwrap_or("mock-device-token");
+        let expected_proof = state.sync_key_proof.as_deref().unwrap_or("");
+        let expected_auth = format!("Bearer {expected_token}");
+        if request.headers.get("authorization").map(String::as_str) != Some(expected_auth.as_str())
+        {
+            return Err(json_response(
+                401,
+                json!({ "ok": false, "error": "invalid_device_token" }),
+            ));
+        }
+        if request
+            .headers
+            .get("x-codex-tools-sync-key-proof")
+            .map(String::as_str)
+            != Some(expected_proof)
+        {
+            return Err(json_response(
+                403,
+                json!({ "ok": false, "error": "invalid_sync_key" }),
+            ));
+        }
+        Ok(())
+    }
+
+    fn mock_list_sessions(state: &Arc<Mutex<MockApiState>>) -> Vec<u8> {
+        let mut manifests = state
+            .lock()
+            .unwrap()
+            .versions
+            .values()
+            .filter_map(|versions| {
+                versions
+                    .iter()
+                    .max_by_key(|version| version.manifest.uploaded_at_ms)
+                    .map(|version| version.manifest.clone())
+            })
+            .collect::<Vec<_>>();
+        manifests.sort_by(|left, right| right.uploaded_at_ms.cmp(&left.uploaded_at_ms));
+        json_response(200, json!({ "ok": true, "sessions": manifests }))
+    }
+
+    fn mock_put_version(
+        request: MockHttpRequest,
+        state: &Arc<Mutex<MockApiState>>,
+        session_id: &str,
+        raw_sha256: &str,
+    ) -> Vec<u8> {
+        let manifest_header = request.headers.get("x-codex-tools-manifest").unwrap();
+        let mut manifest: SessionManifest =
+            serde_json::from_slice(&STANDARD.decode(manifest_header).unwrap()).unwrap();
+        assert_eq!(manifest.session_id, session_id);
+        assert_eq!(manifest.raw_sha256, raw_sha256);
+        assert_eq!(sha256_hex(&request.body), manifest.encrypted_sha256);
+        assert_eq!(request.body.len(), manifest.encrypted_size);
+        let mut state = state.lock().unwrap();
+        {
+            let versions = state.versions.entry(session_id.to_string()).or_default();
+            if let Some(existing) = versions
+                .iter()
+                .find(|version| version.manifest.raw_sha256 == raw_sha256)
+            {
+                return json_response(
+                    200,
+                    json!({ "ok": true, "skipped": true, "manifest": existing.manifest }),
+                );
+            }
+        }
+        state.put_versions += 1;
+        manifest.blob_key = format!("mock/{session_id}/{raw_sha256}.enc");
+        state
+            .versions
+            .entry(session_id.to_string())
+            .or_default()
+            .push(MockStoredVersion {
+                manifest: manifest.clone(),
+                encrypted: request.body,
+            });
+        json_response(200, json!({ "ok": true, "manifest": manifest }))
+    }
+
+    fn mock_latest_version(state: &Arc<Mutex<MockApiState>>, session_id: &str) -> Vec<u8> {
+        if let Some(version) = state
+            .lock()
+            .unwrap()
+            .versions
+            .get(session_id)
+            .and_then(|versions| {
+                versions
+                    .iter()
+                    .max_by_key(|version| version.manifest.uploaded_at_ms)
+                    .cloned()
+            })
+        {
+            return json_response(200, json!({ "ok": true, "manifest": version.manifest }));
+        }
+        json_response(404, json!({ "ok": false, "error": "session_not_found" }))
+    }
+
+    fn mock_get_blob(
+        state: &Arc<Mutex<MockApiState>>,
+        session_id: &str,
+        raw_sha256: &str,
+    ) -> Vec<u8> {
+        if let Some(version) = state
+            .lock()
+            .unwrap()
+            .versions
+            .get(session_id)
+            .and_then(|versions| {
+                versions
+                    .iter()
+                    .find(|version| version.manifest.raw_sha256 == raw_sha256)
+                    .cloned()
+            })
+        {
+            return bytes_response(200, version.encrypted);
+        }
+        json_response(404, json!({ "ok": false, "error": "version_not_found" }))
+    }
+
+    fn parse_version_path(path: &str) -> Option<(String, String)> {
+        let parts = path.split('/').collect::<Vec<_>>();
+        if parts.len() == 6 && parts[1] == "v1" && parts[2] == "sessions" && parts[4] == "versions"
+        {
+            return Some((parts[3].to_string(), parts[5].to_string()));
+        }
+        None
+    }
+
+    fn parse_latest_path(path: &str) -> Option<String> {
+        let parts = path.split('/').collect::<Vec<_>>();
+        if parts.len() == 6
+            && parts[1] == "v1"
+            && parts[2] == "sessions"
+            && parts[4] == "versions"
+            && parts[5] == "latest"
+        {
+            return Some(parts[3].to_string());
+        }
+        None
+    }
+
+    fn parse_blob_path(path: &str) -> Option<(String, String)> {
+        let parts = path.split('/').collect::<Vec<_>>();
+        if parts.len() == 7
+            && parts[1] == "v1"
+            && parts[2] == "sessions"
+            && parts[4] == "versions"
+            && parts[6] == "blob"
+        {
+            return Some((parts[3].to_string(), parts[5].to_string()));
+        }
+        None
+    }
+
+    fn json_response(status: u16, body: Value) -> Vec<u8> {
+        bytes_response_with_type(
+            status,
+            serde_json::to_vec(&body).unwrap(),
+            "application/json",
+        )
+    }
+
+    fn bytes_response(status: u16, body: Vec<u8>) -> Vec<u8> {
+        bytes_response_with_type(status, body, "application/octet-stream")
+    }
+
+    fn bytes_response_with_type(status: u16, body: Vec<u8>, content_type: &str) -> Vec<u8> {
+        let status_text = match status {
+            200 => "OK",
+            401 => "Unauthorized",
+            403 => "Forbidden",
+            404 => "Not Found",
+            _ => "OK",
+        };
+        let mut response = format!(
+            "HTTP/1.1 {status} {status_text}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend(body);
+        response
     }
 }

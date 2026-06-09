@@ -418,6 +418,7 @@ fn cloud_push_api(args: &[String], api: &ApiClient) -> Result<(), String> {
         session_concurrency: concurrency_option(
             args,
             &["--session-concurrency", "--session-threads"],
+            &["-n", "--n", "--threads"],
             "CODEX_TOOLS_SESSION_UPLOAD_CONCURRENCY",
             DEFAULT_SESSION_UPLOAD_CONCURRENCY,
             MAX_SESSION_UPLOAD_CONCURRENCY,
@@ -425,6 +426,7 @@ fn cloud_push_api(args: &[String], api: &ApiClient) -> Result<(), String> {
         chunk_concurrency: concurrency_option(
             args,
             &["--chunk-concurrency", "--chunk-threads"],
+            &["-n", "--n", "--threads"],
             "CODEX_TOOLS_CHUNK_UPLOAD_CONCURRENCY",
             DEFAULT_CHUNK_UPLOAD_CONCURRENCY,
             MAX_CHUNK_UPLOAD_CONCURRENCY,
@@ -693,6 +695,7 @@ fn cloud_pull_api(args: &[String], api: &ApiClient) -> Result<(), String> {
     let download_concurrency = concurrency_option(
         args,
         &["--download-concurrency", "--download-threads"],
+        &["-n", "--n", "--threads"],
         "CODEX_TOOLS_CHUNK_DOWNLOAD_CONCURRENCY",
         DEFAULT_CHUNK_DOWNLOAD_CONCURRENCY,
         MAX_CHUNK_DOWNLOAD_CONCURRENCY,
@@ -1668,6 +1671,7 @@ fn option_usize(args: &[String], name: &str) -> Result<Option<usize>, String> {
 fn concurrency_option(
     args: &[String],
     names: &[&str],
+    fallback_names: &[&str],
     env_key: &str,
     default_value: usize,
     max_value: usize,
@@ -1675,23 +1679,31 @@ fn concurrency_option(
     let value = names
         .iter()
         .find_map(|name| option_value(args, name))
+        .or_else(|| {
+            fallback_names
+                .iter()
+                .find_map(|name| option_value(args, name))
+        })
         .or_else(|| optional_env(env_key));
+    let accepted_names = names
+        .iter()
+        .chain(fallback_names.iter())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
     let Some(value) = value else {
         return Ok(default_value);
     };
     let parsed = value.parse::<usize>().map_err(|_| {
         format!(
             "invalid concurrency value for {} / {}: {}",
-            names.join(", "),
-            env_key,
-            value
+            accepted_names, env_key, value
         )
     })?;
     if parsed == 0 {
         return Err(format!(
             "concurrency value for {} / {} must be greater than 0",
-            names.join(", "),
-            env_key
+            accepted_names, env_key
         ));
     }
     Ok(parsed.min(max_value))
@@ -1784,16 +1796,18 @@ Usage:
   codex-tools cloud logout
   codex-tools cloud register --email EMAIL [--device NAME] [--platform NAME] [--invite-code CODE]
   codex-tools cloud smoke
-  codex-tools cloud push --all [--limit N] [--device NAME] [--codex-home PATH] [--force] [--session-concurrency N] [--chunk-concurrency N]
-  codex-tools cloud push --session-id ID [--device NAME] [--codex-home PATH] [--force] [--chunk-concurrency N]
+  codex-tools cloud push --all [--limit N] [--device NAME] [--codex-home PATH] [--force] [-n N]
+  codex-tools cloud push --session-id ID [--device NAME] [--codex-home PATH] [--force] [-n N]
   codex-tools cloud list [--json]
-  codex-tools cloud pull --session-id ID [--codex-home PATH] [--dry-run] [--force] [--download-concurrency N]
+  codex-tools cloud pull --session-id ID [--codex-home PATH] [--dry-run] [--force] [-n N]
 
 Run `codex-tools cloud login` once to save local cloud configuration.
 Environment variables CODEX_TOOLS_API_URL, CODEX_TOOLS_DEVICE_TOKEN, and
 CODEX_TOOLS_SYNC_PASSPHRASE are optional overrides for automation.
-Tune upload parallelism with --session-concurrency/--chunk-concurrency.
-Tune chunked restore parallelism with --download-concurrency.
+Tune transfer parallelism with -n N. On push, -n applies to session upload
+groups and chunk uploads. On pull, -n applies to chunk downloads.
+Advanced aliases remain available: --threads, --session-concurrency,
+--chunk-concurrency, and --download-concurrency.
 Environment fallbacks: CODEX_TOOLS_SESSION_UPLOAD_CONCURRENCY,
 CODEX_TOOLS_CHUNK_UPLOAD_CONCURRENCY, and CODEX_TOOLS_CHUNK_DOWNLOAD_CONCURRENCY.
 New device registration sends invite code sub2api.simplaj.top by default.
@@ -1858,6 +1872,31 @@ mod tests {
         assert_eq!(groups[0][1].relative_path, "sessions/new.jsonl");
         assert_eq!(groups[1].len(), 1);
         assert_eq!(groups[1][0].session_id, "s2");
+    }
+
+    #[test]
+    fn n_option_sets_transfer_concurrency() {
+        let args = vec!["-n".to_string(), "6".to_string()];
+
+        let value =
+            concurrency_option(&args, &["--specific"], &["-n"], "MISSING_ENV_KEY", 1, 8).unwrap();
+
+        assert_eq!(value, 6);
+    }
+
+    #[test]
+    fn specific_concurrency_option_overrides_n() {
+        let args = vec![
+            "-n".to_string(),
+            "6".to_string(),
+            "--specific".to_string(),
+            "3".to_string(),
+        ];
+
+        let value =
+            concurrency_option(&args, &["--specific"], &["-n"], "MISSING_ENV_KEY", 1, 8).unwrap();
+
+        assert_eq!(value, 3);
     }
 
     fn test_local_session(

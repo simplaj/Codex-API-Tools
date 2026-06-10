@@ -220,7 +220,9 @@ fn run_local_status() -> Result<(), String> {
 fn run_provider(args: &[String]) -> Result<(), String> {
     let output = match args.first().map(String::as_str) {
         Some("status") | None => local_tools::provider_status_text(),
-        Some("sync") => local_tools::provider_sync_text(option_value(args, "--provider")),
+        Some("sync") => {
+            local_tools::provider_sync_text(option_value(args, "--provider"), flag(args, "--force"))
+        }
         Some("switch") => local_tools::provider_switch_text(
             option_value(args, "--provider").or_else(|| args.get(1).cloned()),
         ),
@@ -2035,7 +2037,7 @@ Usage:
   codex-tools codex quit
   codex-tools provider status
   codex-tools provider repair [--name simplaj] [--no-sync]
-  codex-tools provider sync [--provider NAME]
+  codex-tools provider sync [--provider NAME] [--force]
   codex-tools provider switch NAME
   codex-tools auth unlock
   codex-tools auth token [--provider NAME] [--key sk-...]
@@ -2055,6 +2057,8 @@ Usage:
 
 Local config write commands require Codex to be fully closed. Run
 `codex-tools codex quit` first, or close Codex manually if detection fails.
+For provider sync only, `--force` skips the process preflight while still
+checking the SQLite write lock before changing history metadata.
 
 Run `codex-tools cloud login` once to save local cloud sync configuration.
 Environment variables CODEX_TOOLS_API_URL, CODEX_TOOLS_EMAIL,

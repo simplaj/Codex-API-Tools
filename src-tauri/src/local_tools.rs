@@ -2274,8 +2274,10 @@ fn render_native_status() -> Result<String, String> {
     Ok(lines.join("\n"))
 }
 
-fn run_native_sync(target_provider: &str) -> Result<String, String> {
-    ensure_codex_stopped_for_write("同步历史会话 metadata")?;
+fn run_native_sync(target_provider: &str, force_process_preflight: bool) -> Result<String, String> {
+    if !force_process_preflight {
+        ensure_codex_stopped_for_write("同步历史会话 metadata")?;
+    }
     let codex_home = codex_home()?;
     let scan = collect_rollout_scan(&codex_home, Some(target_provider))?;
     let cwd_stats = read_thread_cwd_stats(&codex_home)?;
@@ -2319,6 +2321,11 @@ fn run_native_sync(target_provider: &str) -> Result<String, String> {
             }
         ),
     ];
+    if force_process_preflight {
+        lines.push(
+            "Process preflight skipped by --force; SQLite write lock was still checked.".into(),
+        );
+    }
     if sqlite_stats.thread_rows_inserted > 0 {
         lines.push(format!(
             "Inserted SQLite thread indexes: {}",
@@ -2365,7 +2372,7 @@ fn run_native_switch(target_provider: &str) -> Result<String, String> {
         set_root_provider(&config_text, target_provider),
     )
     .map_err(command_error)?;
-    let sync_output = run_native_sync(target_provider)?;
+    let sync_output = run_native_sync(target_provider, false)?;
     Ok(format!(
         "Switched root provider to {target_provider}.\nConfig backup: {}\n\n{sync_output}",
         backup.backup_dir
@@ -2491,6 +2498,9 @@ fn detect_codex_processes() -> Result<Vec<CodexProcess>, String> {
 
 fn is_codex_process_command(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
+    let executable = command_executable(command);
+    let name = executable_file_name(executable);
+    let name = name.trim_end_matches(".exe");
     if lower.is_empty()
         || lower.contains("codex api tools")
         || lower.contains("codex-api-tools")
@@ -2498,6 +2508,12 @@ fn is_codex_process_command(command: &str) -> bool {
         || lower.contains("codex-tools")
         || lower.contains("codex computer use.app")
         || lower.contains("skycomputeruseclient")
+        || lower.contains("browser_crashpad_handler")
+        || lower.contains("crashpad_handler")
+        || name == "browser_crashpad_handler"
+        || name == "crashpad_handler"
+        || (lower.contains("/.vscode/extensions/openai.chatgpt-")
+            && lower.contains("codex app-server"))
     {
         return false;
     }
@@ -2506,9 +2522,6 @@ fn is_codex_process_command(command: &str) -> bool {
         return true;
     }
 
-    let executable = command_executable(command);
-    let name = executable_file_name(executable);
-    let name = name.trim_end_matches(".exe");
     name == "codex"
 }
 
@@ -2970,13 +2983,21 @@ fn inspect() -> Result<InspectState, String> {
 fn run_provider_sync(
     command: Option<String>,
     provider_id: Option<String>,
+    force_process_preflight: bool,
 ) -> Result<ShellResult, String> {
     let command_name = command.unwrap_or_else(|| "status".into());
     let started_at = unix_millis();
     let target_provider = resolve_sync_target(provider_id);
     let command_text = match command_name.as_str() {
         "status" => format!("{NATIVE_SYNC_ENGINE} status"),
-        "sync" => format!("{NATIVE_SYNC_ENGINE} sync --provider {target_provider}"),
+        "sync" => format!(
+            "{NATIVE_SYNC_ENGINE} sync --provider {target_provider}{}",
+            if force_process_preflight {
+                " --force"
+            } else {
+                ""
+            }
+        ),
         "switch" => format!("{NATIVE_SYNC_ENGINE} switch {target_provider}"),
         other => {
             return Ok(native_shell_result(
@@ -2990,7 +3011,7 @@ fn run_provider_sync(
     };
     let outcome = match command_name.as_str() {
         "status" => render_native_status(),
-        "sync" => run_native_sync(&target_provider),
+        "sync" => run_native_sync(&target_provider, force_process_preflight),
         "switch" => run_native_switch(&target_provider),
         _ => unreachable!(),
     };
@@ -3046,6 +3067,7 @@ fn repair_provider(
         Some(run_provider_sync(
             Some("sync".into()),
             Some(provider_id.clone()),
+            false,
         )?)
     } else {
         None
@@ -3444,6 +3466,12 @@ requires_openai_auth = true
         assert!(!is_codex_process_command(
             "/Users/user/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService"
         ));
+        assert!(!is_codex_process_command(
+            "/Applications/Codex.app/Contents/Frameworks/Codex Framework.framework/Versions/149.0.7827.54/Helpers/browser_crashpad_handler --monitor-self --database=/Users/user/Library/Application Support/com.openai.codex/web/Crashpad"
+        ));
+        assert!(!is_codex_process_command(
+            "/Users/user/.vscode/extensions/openai.chatgpt-26.5602.71036-darwin-arm64/bin/macos-aarch64/codex app-server --analytics-default-enabled"
+        ));
     }
 }
 
@@ -3539,9 +3567,12 @@ pub fn provider_status_text() -> Result<String, String> {
     render_native_status()
 }
 
-pub fn provider_sync_text(provider_id: Option<String>) -> Result<String, String> {
+pub fn provider_sync_text(
+    provider_id: Option<String>,
+    force_process_preflight: bool,
+) -> Result<String, String> {
     let target = resolve_sync_target(provider_id);
-    run_native_sync(&target)
+    run_native_sync(&target, force_process_preflight)
 }
 
 pub fn provider_switch_text(provider_id: Option<String>) -> Result<String, String> {

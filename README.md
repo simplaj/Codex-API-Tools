@@ -61,6 +61,13 @@ codex-tools cloud login --email user@example.com
 codex-tools cloud push --all -n 8
 ```
 
+To back up only one session, first list local sessions, then push that session id:
+
+```bash
+codex-tools sessions list --limit 20
+codex-tools cloud push --session-id 019cbf7c-1db4-7922-a155-d68fff7b82da
+```
+
 On the target machine, use the same email and the same Sync key, then download the cloud sessions:
 
 ```bash
@@ -68,6 +75,13 @@ codex-tools codex quit
 codex-tools cloud login --email user@example.com
 codex-tools cloud list
 codex-tools cloud pull --all -n 8
+```
+
+To restore only one session, use the `pull` command printed by `cloud list`:
+
+```bash
+codex-tools cloud list
+codex-tools cloud pull --session-id 019cbf7c-1db4-7922-a155-d68fff7b82da
 ```
 
 If the target machine uses a different provider name, run provider sync after `cloud pull` or the restored sessions may not show up in the Codex UI:

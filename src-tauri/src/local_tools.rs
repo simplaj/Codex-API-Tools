@@ -2508,6 +2508,7 @@ fn is_codex_process_command(command: &str) -> bool {
         || lower.contains("codex-tools")
         || lower.contains("codex computer use.app")
         || lower.contains("skycomputeruseclient")
+        || (lower.contains("/contents/frameworks/") && lower.contains("/helpers/"))
         || lower.contains("browser_crashpad_handler")
         || lower.contains("crashpad_handler")
         || name == "browser_crashpad_handler"
@@ -2580,17 +2581,54 @@ fn ensure_codex_stopped_for_write(action: &str) -> Result<(), String> {
     if processes.is_empty() {
         return Ok(());
     }
-    let preview = processes
-        .iter()
-        .take(5)
-        .map(|process| format!("{} {}", process.pid, process.command))
-        .collect::<Vec<_>>()
-        .join("; ");
     Err(format!(
-        "{action} 前必须完全退出 Codex App、Codex CLI 和 app-server。当前仍检测到 {} 个相关进程：{}",
-        processes.len(),
-        preview
+        "{action} 前必须完全退出 Codex App、Codex CLI 和 app-server。当前仍检测到 {}。请先执行 `codex-tools codex quit`；如果仍失败，请手动关闭正在运行的 Codex 窗口、终端里的 Codex CLI，或真正的 Codex app-server 后重试。",
+        summarize_codex_processes(&processes)
     ))
+}
+
+fn summarize_codex_processes(processes: &[CodexProcess]) -> String {
+    let mut app_count = 0usize;
+    let mut app_server_count = 0usize;
+    let mut cli_count = 0usize;
+    let mut other_count = 0usize;
+
+    for process in processes {
+        let lower = process.command.to_ascii_lowercase();
+        if lower.contains(" app-server") || lower.ends_with(" app-server") {
+            app_server_count += 1;
+        } else if lower.contains("/applications/codex.app/")
+            || lower.contains("\\appdata\\local\\programs\\codex\\")
+        {
+            app_count += 1;
+        } else if executable_file_name(command_executable(&process.command))
+            .trim_end_matches(".exe")
+            == "codex"
+        {
+            cli_count += 1;
+        } else {
+            other_count += 1;
+        }
+    }
+
+    let mut pieces = Vec::new();
+    if app_count > 0 {
+        pieces.push(format!("Codex App {app_count} 个"));
+    }
+    if app_server_count > 0 {
+        pieces.push(format!("app-server {app_server_count} 个"));
+    }
+    if cli_count > 0 {
+        pieces.push(format!("Codex CLI {cli_count} 个"));
+    }
+    if other_count > 0 {
+        pieces.push(format!("其他相关进程 {other_count} 个"));
+    }
+    if pieces.is_empty() {
+        format!("{} 个相关进程", processes.len())
+    } else {
+        pieces.join("、")
+    }
 }
 
 fn mask_email(value: &str) -> String {
